@@ -73,6 +73,11 @@ def _make_mappo_cfg(raw: Dict[str, Any]) -> MAPPOConfig:
         max_grad_norm=m.get("max_grad_norm", 10.0),
         num_mini_batch=m.get("num_mini_batch", 4),
         use_popart=m.get("use_popart", True),
+        use_rise=m.get("use_rise", False),
+        lambda_risk=m.get("lambda_risk", 0.1),
+        cvar_loss_coef=m.get("cvar_loss_coef", 0.5),
+        gp_attention_eta=m.get("gp_attention_eta", 1.0),
+        gp_attention_heads=m.get("gp_attention_heads", 1),
     )
 
 

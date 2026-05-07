@@ -1,0 +1,8 @@
+# RISE-MAPPO ablation: keep GP-uncertainty attention but drop CVaR head training.
+# CVaR head runs forward but contributes nothing to actor advantage / loss.
+
+mappo:
+  use_rise: true
+  lambda_risk: 0.0
+  cvar_loss_coef: 0.0
+  gp_attention_eta: 1.0

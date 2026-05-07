@@ -68,12 +68,14 @@ class Runner:
         self.num_agents = self.envs[0].cfg.num_robots
         self.local_shapes = self.envs[0].observation_shapes()
         self.global_shapes = self.envs[0].global_state_shapes()
+        self.use_rise = bool(getattr(self.algo.cfg, "use_rise", False))
         self.buffer = RolloutBuffer(
             BufferConfig(
                 rollout_length=runner_cfg.rollout_length,
                 num_envs=runner_cfg.num_envs,
                 num_agents=self.num_agents,
                 device=str(self.device),
+                use_rise=self.use_rise,
             ),
             self.local_shapes,
             self.global_shapes,
@@ -145,17 +147,24 @@ class Runner:
             local_stack = self._stack_local(self._cur_local, agents, local_keys)
             global_stack = self._stack_global(self._cur_global, global_keys)
             actions, log_probs = self._sample_actions(local_stack, E, A)
-            values = self._compute_values(global_stack)
+            if self.use_rise:
+                values, values_cvar, agent_sigmas = self._compute_values_rise(global_stack)
+            else:
+                values = self._compute_values(global_stack)
+                values_cvar = None
+                agent_sigmas = None
             # Step each env with corresponding actions.
             rewards = np.zeros(E, dtype=np.float32)
+            risk_costs = np.zeros(E, dtype=np.float32) if self.use_rise else None
             dones = np.zeros(E, dtype=np.float32)
             new_local: List[Dict[str, Dict[str, np.ndarray]]] = []
             new_global: List[Dict[str, np.ndarray]] = []
             for i, env in enumerate(self.envs):
                 act_dict = {a: int(actions[i, j]) for j, a in enumerate(agents)}
                 obs, rew_dict, term_dict, trunc_dict, info = env.step(act_dict)
-                # Team-shared reward → take any one.
                 rewards[i] = float(next(iter(rew_dict.values())))
+                if self.use_rise:
+                    risk_costs[i] = float(info.get("risk_cost", 0.0))
                 done = any(term_dict.values()) or any(trunc_dict.values())
                 ep_r[i] += rewards[i]
                 if done:
@@ -176,14 +185,23 @@ class Runner:
                 rewards=rewards,
                 dones=dones,
                 values=values,
+                risk_costs=risk_costs,
+                values_cvar=values_cvar,
+                agent_sigmas=agent_sigmas,
             )
             self._cur_local = new_local
             self._cur_global = new_global
         # Bootstrap at horizon.
         global_stack = self._stack_global(self._cur_global, global_keys)
-        last_values = self._compute_values(global_stack)
+        if self.use_rise:
+            last_values, last_values_cvar, _ = self._compute_values_rise(global_stack)
+        else:
+            last_values = self._compute_values(global_stack)
+            last_values_cvar = None
         last_dones = np.zeros(E, dtype=np.float32)
-        self.buffer.compute_returns_and_advantages(last_values, last_dones)
+        self.buffer.compute_returns_and_advantages(
+            last_values, last_dones, last_values_cvar=last_values_cvar,
+        )
         return {
             "ep_reward_mean": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
             "ep_coverage_mean": float(np.mean(episode_coverages)) if episode_coverages else 0.0,
@@ -215,10 +233,32 @@ class Runner:
         flat = {k: torch.from_numpy(v).to(self.device) for k, v in global_stack.items()}
         v = self.critic(flat).cpu().numpy()
         if self.critic.popart is not None and float(self.critic.popart.debias) > 1e-6:
-            # The critic returns *normalised* outputs in PopArt land.
             v_t = torch.from_numpy(v).to(self.device)
             v = self.critic.popart.denormalize(v_t).cpu().numpy()
         return v.astype(np.float32)
+
+    @torch.no_grad()
+    def _compute_values_rise(
+        self, global_stack: Dict[str, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """RISE-MAPPO: query dual-head critic with GP-uncertainty attention.
+
+        Returns ``(v_mean, v_cvar, agent_sigmas)`` for the buffer; the
+        agent_sigmas are stored so the PPO update reproduces the exact
+        attention conditioning.
+        """
+        flat = {k: torch.from_numpy(v).to(self.device) for k, v in global_stack.items()}
+        sigmas = self.critic.extract_agent_sigmas(flat)        # (E, A)
+        v_mean, v_cvar = self.critic(flat, agent_sigmas=sigmas)
+        if self.critic.popart_mean is not None and float(self.critic.popart_mean.debias) > 1e-6:
+            v_mean = self.critic.popart_mean.denormalize(v_mean)
+        if self.critic.popart_cvar is not None and float(self.critic.popart_cvar.debias) > 1e-6:
+            v_cvar = self.critic.popart_cvar.denormalize(v_cvar)
+        return (
+            v_mean.cpu().numpy().astype(np.float32),
+            v_cvar.cpu().numpy().astype(np.float32),
+            sigmas.cpu().numpy().astype(np.float32),
+        )
 
     # ------------------------------------------------------------------
     def train(self) -> None:
@@ -279,6 +319,9 @@ def build_default_pipeline(
         grid_size=probe.world.grid_size,
         num_robots=env_cfg.num_robots,
         use_popart=mappo_cfg.use_popart,
+        use_rise=mappo_cfg.use_rise,
+        gp_attention_eta=mappo_cfg.gp_attention_eta,
+        world_size=env_cfg.world_size,
     ))
     device = torch.device(runner_cfg.device if torch.cuda.is_available() or runner_cfg.device == "cpu" else "cpu")
     algo = MAPPO(actor=actor, critic=critic, config=mappo_cfg, device=device)

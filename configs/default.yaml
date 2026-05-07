@@ -40,6 +40,13 @@ mappo:
   num_mini_batch: 4
   use_popart: true
 
+  # RISE-MAPPO (Phase 2.5 — Risk-Sensitive Information-Gain MAPPO)
+  use_rise: true
+  lambda_risk: 0.1
+  cvar_loss_coef: 0.5
+  gp_attention_eta: 1.0
+  gp_attention_heads: 1
+
 # Reward weights (passed through to the env)
 reward:
   w_coverage: 1.0

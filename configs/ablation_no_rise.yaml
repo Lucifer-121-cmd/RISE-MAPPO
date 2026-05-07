@@ -1,0 +1,9 @@
+# RISE-MAPPO ablation: standard MAPPO (no RISE).
+# Disables both novel modules — single-head critic + standard advantage.
+# Inherits from default.yaml; only overrides listed below.
+
+mappo:
+  use_rise: false
+  lambda_risk: 0.0
+  cvar_loss_coef: 0.0
+  gp_attention_eta: 0.0

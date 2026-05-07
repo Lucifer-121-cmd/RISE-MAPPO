@@ -8,7 +8,7 @@ __pycache__/
 # Files
 CLAUDE_CODE_PROMPT.md
 PHASE2_CLAUDE_CODE_PROMPT.md
-
+PHASE2_5_RISE_MAPPO_PROMPT.md
 # Python compiled files
 *.pyc
 *.pyo

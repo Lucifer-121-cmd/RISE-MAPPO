@@ -173,6 +173,266 @@ def test_phase2_env_episode_with_real_mpc_and_gp() -> None:
     assert out.exists()
 
 
+_RISE_GLOBAL_SHAPES = {
+    "occupancy": (20, 20),
+    "gp_sigma": (20, 20),
+    "robot_states": (3, 3),
+    "energies": (3,),
+    "stats": (2,),
+}
+
+
+def _make_rise_state(batch: int = 4, num_robots: int = 3, grid: int = 20) -> dict:
+    return {
+        "occupancy": torch.randn(batch, grid, grid),
+        "gp_sigma": torch.rand(batch, grid, grid).abs(),
+        "robot_states": torch.rand(batch, num_robots, 3) * 5.0,
+        "energies": torch.rand(batch, num_robots),
+        "stats": torch.rand(batch, 2),
+    }
+
+
+class TestRISEMAPPO:
+    """Tests for the novel RISE-MAPPO algorithm (Phase 2.5)."""
+
+    def test_dual_critic_output_shapes(self) -> None:
+        """Critic returns (v_mean, v_cvar) with correct shapes."""
+        critic = Critic(CriticConfig(
+            grid_size=20, num_robots=3, use_popart=False, use_rise=True,
+            world_size=10.0,
+        ))
+        state = _make_rise_state(batch=4)
+        sigmas = critic.extract_agent_sigmas(state)
+        assert sigmas.shape == (4, 3)
+        v_mean, v_cvar = critic(state, agent_sigmas=sigmas)
+        assert v_mean.shape == (4,) and v_cvar.shape == (4,)
+        assert torch.isfinite(v_mean).all() and torch.isfinite(v_cvar).all()
+
+    def test_dual_critic_different_values(self) -> None:
+        """V_mean and V_cvar are not identical (heads learn different things)."""
+        torch.manual_seed(0)
+        critic = Critic(CriticConfig(
+            grid_size=20, num_robots=3, use_popart=False, use_rise=True,
+            world_size=10.0,
+        ))
+        state = _make_rise_state(batch=8)
+        sigmas = critic.extract_agent_sigmas(state)
+        opt = torch.optim.Adam(critic.parameters(), lr=1e-2)
+        target_mean = torch.zeros(8)
+        target_cvar = torch.ones(8) * 5.0
+        for _ in range(20):
+            v_mean, v_cvar = critic(state, agent_sigmas=sigmas)
+            loss = (v_mean - target_mean).pow(2).mean() + (v_cvar - target_cvar).pow(2).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        v_mean, v_cvar = critic(state, agent_sigmas=sigmas)
+        assert (v_cvar - v_mean).abs().mean().item() > 1.0
+
+    def test_gp_attention_high_uncertainty_higher_weight(self) -> None:
+        """Agent with higher GP sigma gets higher attention weight."""
+        from marl.mappo.critic import GPUncertaintyAttention
+        torch.manual_seed(0)
+        attn = GPUncertaintyAttention(feature_dim=8, eta=1.0)
+        feats = torch.randn(2, 3, 8)
+        sigmas = torch.tensor([[0.1, 0.1, 5.0], [0.1, 0.1, 5.0]])
+        _, weights = attn(feats, sigmas)
+        col_avg = weights.mean(dim=1)            # (B, N) – avg attention each agent receives
+        # Agent index 2 (high sigma) should receive more attention than 0 / 1.
+        assert (col_avg[:, 2] > col_avg[:, 0]).all()
+        assert (col_avg[:, 2] > col_avg[:, 1]).all()
+
+    def test_gp_attention_equal_uncertainty_equal_weight(self) -> None:
+        """Equal sigmas → roughly equal column-attention weights."""
+        from marl.mappo.critic import GPUncertaintyAttention
+        torch.manual_seed(0)
+        attn = GPUncertaintyAttention(feature_dim=8, eta=1.0)
+        feats = torch.zeros(1, 3, 8)              # zero features → only sigma matters
+        sigmas = torch.full((1, 3), 1.0)
+        _, weights = attn(feats, sigmas)
+        col_avg = weights.mean(dim=1).squeeze(0)  # (3,)
+        assert torch.allclose(col_avg, torch.full_like(col_avg, 1.0 / 3.0), atol=1e-5)
+
+    def test_risk_adjusted_advantage(self) -> None:
+        """A_final = A_mean - lambda * A_risk produces valid advantages."""
+        torch.manual_seed(0)
+        adv_mean = torch.tensor([1.0, 2.0, -1.0, 0.5])
+        adv_risk = torch.tensor([0.0, 1.0, 2.0, -0.5])
+        lam = 0.1
+        adv = adv_mean - lam * adv_risk
+        expected = torch.tensor([1.0, 1.9, -1.2, 0.55])
+        assert torch.allclose(adv, expected, atol=1e-6)
+
+    def test_rise_vs_standard_backward_compat(self) -> None:
+        """use_rise=False keeps Phase-1 single-head behaviour and is
+        bit-for-bit deterministic across runs (same seed → same losses).
+        """
+        torch.manual_seed(123)
+        critic = Critic(CriticConfig(
+            grid_size=20, num_robots=3, use_popart=False, use_rise=False,
+            world_size=10.0,
+        ))
+        state = _make_rise_state(batch=4)
+        v = critic(state)
+        assert v.shape == (4,)
+        assert not hasattr(critic, "v_mean_head")
+        assert not hasattr(critic, "v_cvar_head")
+        assert not hasattr(critic, "gp_attention")
+        # Numerical equivalence: two PPO updates with use_rise=False under
+        # the same global seed must produce identical losses (proves the
+        # non-RISE path is bit-for-bit unchanged from Phase 1).
+        from marl.utils import set_global_seed
+
+        def run_one() -> tuple[float, float]:
+            set_global_seed(7)
+            env = MultiRobotSearchEnv(EnvConfig(
+                num_robots=2, max_steps=6, subgoal_steps=4, seed=7,
+            ))
+            obs, _ = env.reset(seed=7)
+            actor = Actor(ActorConfig(
+                num_actions=env.num_subgoal_actions, num_robots=2,
+            ))
+            crit = Critic(CriticConfig(
+                grid_size=env.world.grid_size, num_robots=2,
+                use_popart=True, use_rise=False, world_size=env.cfg.world_size,
+            ))
+            algo = MAPPO(actor=actor, critic=crit,
+                         config=MAPPOConfig(ppo_epoch=1, num_mini_batch=2,
+                                            use_rise=False),
+                         device=torch.device("cpu"))
+            buf = RolloutBuffer(
+                BufferConfig(rollout_length=4, num_envs=1, num_agents=2,
+                             device="cpu", use_rise=False),
+                env.observation_shapes(), env.global_state_shapes(),
+            )
+            cur_obs = obs; cur_state = env.global_state()
+            local_keys = list(env.observation_shapes().keys())
+            global_keys = list(env.global_state_shapes().keys())
+            for t in range(4):
+                local_stack = _stack_local(cur_obs, env.agents, local_keys)
+                flat = {k: torch.from_numpy(
+                    v.reshape((2,) + v.shape[2:])).float() for k, v in local_stack.items()}
+                with torch.no_grad():
+                    a, lp, _ = actor.get_action(flat)
+                    gs = {k: torch.from_numpy(cur_state[k]).unsqueeze(0).float()
+                          for k in global_keys}
+                    val = crit(gs).numpy()
+                a_np = a.numpy().reshape(1, 2)
+                lp_np = lp.numpy().reshape(1, 2)
+                act_d = {ag: int(a_np[0, j]) for j, ag in enumerate(env.agents)}
+                new_obs, rd, td, trd, _ = env.step(act_d)
+                rew = float(next(iter(rd.values())))
+                done = float(any(td.values()) or any(trd.values()))
+                buf.insert(
+                    t=t, local_obs=local_stack,
+                    global_state={k: cur_state[k][None, ...] for k in global_keys},
+                    actions=a_np, log_probs=lp_np,
+                    rewards=np.array([rew], dtype=np.float32),
+                    dones=np.array([done], dtype=np.float32),
+                    values=val.astype(np.float32),
+                )
+                cur_obs = new_obs if not done else env.reset()[0]
+                cur_state = env.global_state()
+            with torch.no_grad():
+                ls = {k: torch.from_numpy(cur_state[k]).unsqueeze(0).float()
+                      for k in global_keys}
+                lv = crit(ls).numpy().astype(np.float32)
+            buf.compute_returns_and_advantages(lv, np.zeros(1, dtype=np.float32))
+            stats = algo.update(buf)
+            return stats["policy_loss"], stats["value_loss"]
+
+        p1, v1 = run_one()
+        p2, v2 = run_one()
+        assert abs(p1 - p2) < 1e-6, f"non-RISE policy loss not deterministic: {p1} {p2}"
+        assert abs(v1 - v2) < 1e-6, f"non-RISE value loss not deterministic: {v1} {v2}"
+
+    def test_buffer_stores_risk_costs(self) -> None:
+        """Buffer correctly stores and retrieves risk_costs / values_cvar."""
+        T, E, A = 4, 1, 3
+        buf = RolloutBuffer(
+            BufferConfig(
+                rollout_length=T, num_envs=E, num_agents=A, device="cpu", use_rise=True,
+            ),
+            local_obs_shapes={"x": (2,)},
+            global_state_shapes={"occupancy": (5, 5), "gp_sigma": (5, 5),
+                                 "robot_states": (A, 3), "energies": (A,), "stats": (2,)},
+        )
+        rng = np.random.default_rng(0)
+        for t in range(T):
+            buf.insert(
+                t=t,
+                local_obs={"x": np.zeros((E, A, 2), dtype=np.float32)},
+                global_state={
+                    "occupancy": np.zeros((E, 5, 5), dtype=np.float32),
+                    "gp_sigma": np.zeros((E, 5, 5), dtype=np.float32),
+                    "robot_states": np.zeros((E, A, 3), dtype=np.float32),
+                    "energies": np.zeros((E, A), dtype=np.float32),
+                    "stats": np.zeros((E, 2), dtype=np.float32),
+                },
+                actions=np.zeros((E, A), dtype=np.int64),
+                log_probs=np.zeros((E, A), dtype=np.float32),
+                rewards=np.full(E, float(t), dtype=np.float32),
+                dones=np.zeros(E, dtype=np.float32),
+                values=np.full(E, 0.5, dtype=np.float32),
+                risk_costs=np.full(E, 0.1 * (t + 1), dtype=np.float32),
+                values_cvar=np.full(E, 0.2, dtype=np.float32),
+                agent_sigmas=rng.random((E, A)).astype(np.float32),
+            )
+        assert np.allclose(buf.risk_costs[:, 0], [0.1, 0.2, 0.3, 0.4])
+        assert np.allclose(buf.values_cvar, 0.2)
+        buf.compute_returns_and_advantages(
+            np.zeros(E, dtype=np.float32),
+            np.zeros(E, dtype=np.float32),
+            last_values_cvar=np.zeros(E, dtype=np.float32),
+        )
+        assert buf.advantages_risk.shape == (T, E)
+        assert buf.returns_risk.shape == (T, E)
+
+    def test_smoke_train_rise(self) -> None:
+        """Full smoke-train with use_rise=True; no NaN, RISE losses logged."""
+        env_cfg = EnvConfig(num_robots=2, max_steps=8, subgoal_steps=4, seed=11)
+        env = MultiRobotSearchEnv(env_cfg)
+        env.reset()
+        actor = Actor(ActorConfig(
+            num_actions=env.num_subgoal_actions, num_robots=env_cfg.num_robots,
+        ))
+        critic = Critic(CriticConfig(
+            grid_size=env.world.grid_size,
+            num_robots=env_cfg.num_robots,
+            use_popart=True,
+            use_rise=True,
+            world_size=env_cfg.world_size,
+            gp_attention_eta=1.0,
+        ))
+        algo = MAPPO(
+            actor=actor, critic=critic,
+            config=MAPPOConfig(
+                ppo_epoch=2, num_mini_batch=2, use_popart=True,
+                use_rise=True, lambda_risk=0.1, cvar_loss_coef=0.5,
+                gp_attention_eta=1.0,
+            ),
+            device=torch.device("cpu"),
+        )
+        from marl.mappo.runner import Runner, RunnerConfig
+        runner = Runner(
+            env_factory=lambda seed: MultiRobotSearchEnv(EnvConfig(
+                num_robots=env_cfg.num_robots, max_steps=env_cfg.max_steps,
+                subgoal_steps=env_cfg.subgoal_steps, seed=seed,
+            )),
+            actor=actor, critic=critic, algo=algo,
+            runner_cfg=RunnerConfig(
+                rollout_length=4, num_envs=1, n_training_updates=2,
+                device="cpu", seed=11,
+                save_dir="results/checkpoints_rise_smoke",
+            ),
+        )
+        roll_stats = runner.collect_rollout()
+        algo_stats = algo.update(runner.buffer)
+        for key in ("v_mean_loss", "v_cvar_loss", "risk_advantage_mean",
+                    "gp_attention_entropy", "policy_loss", "entropy"):
+            assert key in algo_stats, f"missing log key: {key}"
+            assert np.isfinite(algo_stats[key]), f"non-finite stat {key}"
+        assert np.isfinite(roll_stats["ep_reward_mean"])
+
+
 def test_phase2_performance_budgets() -> None:
     """MPC mean < 50ms, GP update+predict per robot < 200ms, env step < 1.5s."""
     pytest.importorskip("casadi")

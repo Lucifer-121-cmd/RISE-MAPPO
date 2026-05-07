@@ -1,0 +1,8 @@
+# RISE-MAPPO ablation: dual-head critic but no GP-uncertainty attention.
+# Keeps the CVaR head; disables the attention modulation by zeroing eta.
+
+mappo:
+  use_rise: true
+  lambda_risk: 0.1
+  cvar_loss_coef: 0.5
+  gp_attention_eta: 0.0

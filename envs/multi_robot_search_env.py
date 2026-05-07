@@ -261,6 +261,9 @@ class MultiRobotSearchEnv:
                 lyap_total / max(1, self.cfg.subgoal_steps * self.cfg.num_robots)
             ),
             "mpc_infeasible": int(infeasible_count),
+            # RISE-MAPPO: raw CVaR risk (unweighted) and per-agent GP sigma.
+            "risk_cost": float(cvar_total),
+            "agent_sigmas": self._per_agent_sigmas(),
         }
         return self._build_observations(), rewards, terminations, truncations, infos
 
@@ -375,3 +378,16 @@ class MultiRobotSearchEnv:
     def _build_global_state(self) -> Dict[str, np.ndarray]:
         from envs.observations import build_global_state
         return build_global_state(self)
+
+    def _per_agent_sigmas(self) -> np.ndarray:
+        """Per-agent GP sigma at each robot's position (RISE-MAPPO attention)."""
+        sigma_grid = self.gp.uncertainty_grid()
+        g = self.world.grid_size
+        res = self.world.cfg.resolution
+        out = np.zeros(self.cfg.num_robots, dtype=np.float32)
+        for i, a in enumerate(self.agents):
+            x, y = self._states[a].pose[:2]
+            ix = int(np.clip(x / res, 0, g - 1))
+            iy = int(np.clip(y / res, 0, g - 1))
+            out[i] = float(sigma_grid[iy, ix])
+        return out
