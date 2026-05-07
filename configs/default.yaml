@@ -1,0 +1,80 @@
+# Paper 3 — default training configuration.
+# All hyperparameters live here; the train script merges this with CLI flags.
+
+env:
+  num_robots: 3
+  world_size: 10.0
+  max_steps: 500
+  sensor_range: 1.5
+  dt: 0.1
+  difficulty: "medium"
+  num_targets: 5
+  num_obstacles: 10
+  num_hazards: 3
+  subgoal_steps: 25
+  detect_range: 0.4
+  robot_radius: 0.105
+  energy_budget: 100.0
+  add_noise: false
+  use_dynamic_step: false
+
+# Robot (TurtleBot3 Burger) — see configs/turtlebot3.yaml for fixed specs.
+robot:
+  max_v: 0.22
+  max_omega: 2.84
+  wheel_radius: 0.033
+  wheel_separation: 0.160
+  mass: 1.0
+
+# MAPPO hyperparameters
+mappo:
+  actor_lr: 5.0e-4
+  critic_lr: 5.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  ppo_epoch: 10
+  clip_param: 0.2
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 10.0
+  num_mini_batch: 4
+  use_popart: true
+
+# Reward weights (passed through to the env)
+reward:
+  w_coverage: 1.0
+  w_detection: 5.0
+  w_cvar_risk: 0.5
+  w_energy: 0.3
+  w_coordination: 0.2
+  w_collision: 10.0
+
+# Lyapunov-MPC (Phase 2 — placeholder values)
+mpc:
+  horizon: 20
+  dt: 0.1
+  Q_diag: [10.0, 10.0, 1.0]
+  R_diag: [1.0, 0.5]
+  alpha_lyap: 0.1
+
+# Distributed GP (Phase 2 — placeholder values)
+gp:
+  kernel: "rbf"
+  lengthscale: 1.0
+  noise: 0.01
+  n_inducing: 50
+  cvar_alpha: 0.05
+
+# Training-time runner config
+training:
+  seed: 42
+  num_envs: 4
+  rollout_length: 256
+  n_training_updates: 1000
+  log_interval: 1
+  save_interval: 50
+  eval_interval: 25
+  device: "cuda"
+  save_dir: "results/checkpoints"
+  use_wandb: false
+  wandb_project: "paper3-marl-search"

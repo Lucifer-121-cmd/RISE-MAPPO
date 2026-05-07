@@ -1,0 +1,22 @@
+# Core scientific stack
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+
+# RL / environment
+gymnasium>=0.29
+torch>=2.0
+
+# Optimization / control (Phase 2)
+casadi>=3.6
+
+# Probabilistic modelling (Phase 2)
+gpytorch>=1.11
+
+# Config + logging
+pyyaml>=6.0
+wandb>=0.16
+
+# Testing
+pytest>=7.4
+pytest-cov>=4.1

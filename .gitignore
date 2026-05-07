@@ -1,0 +1,79 @@
+# Directories
+.claude/
+.venv/
+reference_code/
+__pycache__/
+.pytest_cache/
+
+# Files
+CLAUDE_CODE_PROMPT.md
+PHASE2_CLAUDE_CODE_PROMPT.md
+
+# Python compiled files
+*.pyc
+*.pyo
+*.pyd
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+.directory
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.eggs/
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+*.bak
+*.tmp
+*.temp
+.venv
+reference_code
