@@ -50,12 +50,24 @@ class PopArt(torch.nn.Module):
     @property
     def std(self) -> torch.Tensor:
         var = self.mean_sq - self.mean ** 2
+        var = torch.nan_to_num(var, nan=self.epsilon, posinf=1.0, neginf=self.epsilon)
         return torch.sqrt(torch.clamp(var, min=self.epsilon))
 
     def update(self, x: torch.Tensor) -> None:
         with torch.no_grad():
+            # Self-heal if state was corrupted (e.g. inf loaded from an old
+            # checkpoint with the legacy double-normalised loss). An inf EMA
+            # cannot decay back to a finite value, so reset rather than carry
+            # the poison forward.
+            if not (torch.isfinite(self.mean).all() and torch.isfinite(self.mean_sq).all()):
+                self.mean.zero_()
+                self.mean_sq.fill_(1.0)
+                self.debias.zero_()
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
             batch_mean = x.mean()
             batch_mean_sq = (x ** 2).mean()
+            if not (torch.isfinite(batch_mean) and torch.isfinite(batch_mean_sq)):
+                return
             self.debias.mul_(1 - self.beta).add_(self.beta * 1.0)
             self.mean.mul_(1 - self.beta).add_(self.beta * batch_mean)
             self.mean_sq.mul_(1 - self.beta).add_(self.beta * batch_mean_sq)

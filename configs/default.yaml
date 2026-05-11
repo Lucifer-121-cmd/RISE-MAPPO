@@ -36,15 +36,15 @@ mappo:
   clip_param: 0.2
   entropy_coef: 0.01
   value_loss_coef: 0.5
-  max_grad_norm: 10.0
+  max_grad_norm: 0.5
   num_mini_batch: 4
   use_popart: true
 
   # RISE-MAPPO (Phase 2.5 — Risk-Sensitive Information-Gain MAPPO)
   use_rise: true
-  lambda_risk: 0.1
-  cvar_loss_coef: 0.5
-  gp_attention_eta: 1.0
+  lambda_risk: 0.05
+  cvar_loss_coef: 0.25
+  gp_attention_eta: 0.5
   gp_attention_heads: 1
 
 # Reward weights (passed through to the env)

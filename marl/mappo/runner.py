@@ -254,6 +254,10 @@ class Runner:
             v_mean = self.critic.popart_mean.denormalize(v_mean)
         if self.critic.popart_cvar is not None and float(self.critic.popart_cvar.debias) > 1e-6:
             v_cvar = self.critic.popart_cvar.denormalize(v_cvar)
+        # NaN-safe: never poison the buffer with non-finite values.
+        v_mean = torch.nan_to_num(v_mean, nan=0.0, posinf=0.0, neginf=0.0)
+        v_cvar = torch.nan_to_num(v_cvar, nan=0.0, posinf=0.0, neginf=0.0)
+        sigmas = torch.nan_to_num(sigmas, nan=0.0, posinf=0.0, neginf=0.0)
         return (
             v_mean.cpu().numpy().astype(np.float32),
             v_cvar.cpu().numpy().astype(np.float32),

@@ -58,6 +58,8 @@ class MAPPO:
         self.device = device
         self.actor_optim = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
         self.critic_optim = torch.optim.Adam(critic.parameters(), lr=config.critic_lr)
+        self._update_count = 0
+        self.diag_print = False
 
     def update(self, buffer: RolloutBuffer) -> Dict[str, float]:
         """Run :attr:`MAPPOConfig.ppo_epoch` PPO epochs over ``buffer``."""
@@ -77,6 +79,8 @@ class MAPPO:
                 "risk_advantage_std": 0.0,
                 "gp_attention_entropy": 0.0,
             })
+        self._update_count += 1
+        self._diag_emitted = False
         for _epoch in range(self.cfg.ppo_epoch):
             for batch in buffer.feed_forward_generator(self.cfg.num_mini_batch):
                 metrics = self._update_step(batch)
@@ -98,16 +102,27 @@ class MAPPO:
         targets: torch.Tensor,
         popart,
     ) -> torch.Tensor:
-        """PPO clipped value loss with optional PopArt normalisation."""
+        """PPO clipped value loss with optional PopArt normalisation.
+
+        Standard PopArt convention: the critic head output (``new_values``)
+        lives in *normalised* space; ``old_values`` and ``targets`` come from
+        the buffer in *raw* (de-normalised) space and must be normalised
+        before comparing.  The previous form also normalised ``new_values``,
+        producing ``((new − target)/σ)²`` whose minimiser is ``new → target``
+        in *raw* scale, but the rollout still de-normalised the head as
+        ``head·σ + μ``. That inflated returns by σ, grew σ, and eventually
+        overflowed ``mean_sq`` to FP +inf, freezing the loss at 0.
+        """
+        targets = torch.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+        old_values = torch.nan_to_num(old_values, nan=0.0)
         if self.cfg.use_popart and popart is not None:
             popart.update(targets)
             norm_targets = popart.normalize(targets)
             norm_old = popart.normalize(old_values)
-            norm_new = popart.normalize(new_values)
             v_clipped = norm_old + torch.clamp(
-                norm_new - norm_old, -self.cfg.clip_param, self.cfg.clip_param,
+                new_values - norm_old, -self.cfg.clip_param, self.cfg.clip_param,
             )
-            uncl = (norm_new - norm_targets).pow(2)
+            uncl = (new_values - norm_targets).pow(2)
             cl = (v_clipped - norm_targets).pow(2)
         else:
             v_clipped = old_values + torch.clamp(
@@ -177,6 +192,37 @@ class MAPPO:
         old_values_mean = batch["old_values"]
         old_values_cvar = batch["old_values_cvar"]
         agent_sigmas = batch["agent_sigmas"]
+        first_mb = self.diag_print and not getattr(self, "_diag_emitted", True)
+        if first_mb:
+            with torch.no_grad():
+                pm = self.critic.popart_mean
+                pc = self.critic.popart_cvar
+                def _stat(t):
+                    return (
+                        float(t.min()), float(t.max()), float(t.mean()),
+                        int(torch.isnan(t).sum()), int(torch.isinf(t).sum()),
+                    )
+                rmn = _stat(returns_mean)
+                rrk = _stat(returns_risk)
+                print(
+                    f"[DIAG upd={self._update_count}] PRE-NAN ret_mean min/max/mean={rmn[0]:.3g}/{rmn[1]:.3g}/{rmn[2]:.3g} "
+                    f"nan={rmn[3]} inf={rmn[4]} | ret_risk min/max/mean={rrk[0]:.3g}/{rrk[1]:.3g}/{rrk[2]:.3g} "
+                    f"nan={rrk[3]} inf={rrk[4]}",
+                    flush=True,
+                )
+                print(
+                    f"[DIAG upd={self._update_count}] PopArt mean: mu={float(pm.mean):.4g} sigma={float(pm.std):.4g} debias={float(pm.debias):.4g} | "
+                    f"PopArt cvar: mu={float(pc.mean):.4g} sigma={float(pc.std):.4g} debias={float(pc.debias):.4g}",
+                    flush=True,
+                )
+        # Sanitise inputs: a single NaN slipping in (e.g. from a previously
+        # NaN-poisoned PopArt buffer) would otherwise wreck params here.
+        adv_mean_raw = torch.nan_to_num(adv_mean_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        adv_risk_raw = torch.nan_to_num(adv_risk_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        returns_mean = torch.nan_to_num(returns_mean, nan=0.0, posinf=0.0, neginf=0.0)
+        returns_risk = torch.nan_to_num(returns_risk, nan=0.0, posinf=0.0, neginf=0.0)
+        old_values_mean = torch.nan_to_num(old_values_mean, nan=0.0)
+        old_values_cvar = torch.nan_to_num(old_values_cvar, nan=0.0)
         # Risk-adjusted advantage (core RISE-MAPPO novelty).
         adv = adv_mean_raw - self.cfg.lambda_risk * adv_risk_raw
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -188,24 +234,49 @@ class MAPPO:
         policy_loss = -torch.min(surr1, surr2).mean()
         ent_term = entropy.mean()
         actor_total = policy_loss - self.cfg.entropy_coef * ent_term
-        self.actor_optim.zero_grad(set_to_none=True)
-        actor_total.backward()
-        nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
-        self.actor_optim.step()
+        if torch.isfinite(actor_total):
+            self.actor_optim.zero_grad(set_to_none=True)
+            actor_total.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
+            if all(p.grad is None or torch.isfinite(p.grad).all() for p in self.actor.parameters()):
+                self.actor_optim.step()
         # Critic (dual-head).
         v_mean_pred, v_cvar_pred = self.critic(global_state, agent_sigmas=agent_sigmas)
+        if first_mb:
+            with torch.no_grad():
+                vm = v_mean_pred
+                vc = v_cvar_pred
+                print(
+                    f"[DIAG upd={self._update_count}] v_mean_pred min/max/mean={float(vm.min()):.4g}/{float(vm.max()):.4g}/{float(vm.mean()):.4g} | "
+                    f"v_cvar_pred min/max/mean={float(vc.min()):.4g}/{float(vc.max()):.4g}/{float(vc.mean()):.4g}",
+                    flush=True,
+                )
         v_mean_loss = self._value_loss(
             v_mean_pred, old_values_mean, returns_mean, self.critic.popart_mean,
         )
         v_cvar_loss = self._value_loss(
             v_cvar_pred, old_values_cvar, returns_risk, self.critic.popart_cvar,
         )
+        if first_mb:
+            print(
+                f"[DIAG upd={self._update_count}] RAW LOSS v_mean={float(v_mean_loss):.6g} v_cvar={float(v_cvar_loss):.6g}",
+                flush=True,
+            )
         value_loss = v_mean_loss + self.cfg.cvar_loss_coef * v_cvar_loss
         critic_total = self.cfg.value_loss_coef * value_loss
-        self.critic_optim.zero_grad(set_to_none=True)
-        critic_total.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.max_grad_norm)
-        self.critic_optim.step()
+        if torch.isfinite(critic_total):
+            self.critic_optim.zero_grad(set_to_none=True)
+            critic_total.backward()
+            pre_clip_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.max_grad_norm)
+            if first_mb:
+                print(
+                    f"[DIAG upd={self._update_count}] critic grad_norm (pre-clip)={float(pre_clip_norm):.6g} max_grad_norm={self.cfg.max_grad_norm}",
+                    flush=True,
+                )
+            if all(p.grad is None or torch.isfinite(p.grad).all() for p in self.critic.parameters()):
+                self.critic_optim.step()
+        if first_mb:
+            self._diag_emitted = True
         with torch.no_grad():
             approx_kl = (old_log_probs - new_log_probs).mean()
             clip_frac = ((ratio - 1.0).abs() > self.cfg.clip_param).float().mean()

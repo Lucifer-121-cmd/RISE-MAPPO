@@ -261,8 +261,11 @@ class MultiRobotSearchEnv:
                 lyap_total / max(1, self.cfg.subgoal_steps * self.cfg.num_robots)
             ),
             "mpc_infeasible": int(infeasible_count),
-            # RISE-MAPPO: raw CVaR risk (unweighted) and per-agent GP sigma.
-            "risk_cost": float(cvar_total),
+            # RISE-MAPPO: normalised CVaR risk (same scale as reward's
+            # cvar term) and per-agent GP sigma. Storing raw cvar_total
+            # blew up the CVaR critic head because risk targets ended up
+            # ~subgoal_steps×num_robots larger than reward magnitude.
+            "risk_cost": float(normalised_cvar),
             "agent_sigmas": self._per_agent_sigmas(),
         }
         return self._build_observations(), rewards, terminations, truncations, infos

@@ -105,6 +105,9 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Tiny config for end-to-end test.")
     parser.add_argument("--device", type=str, default=None, help="Override training device.")
     parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument("--resume", type=Path, default=None, help="Load actor+critic from checkpoint.")
+    parser.add_argument("--updates", type=int, default=None, help="Override n_training_updates.")
+    parser.add_argument("--diag", action="store_true", help="Enable critic diagnostic prints.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -117,6 +120,8 @@ def main() -> None:
     runner_cfg = _make_runner_cfg(raw, args.seed, args.smoke)
     if args.device is not None:
         runner_cfg.device = args.device
+    if args.updates is not None:
+        runner_cfg.n_training_updates = args.updates
     _LOG.info(
         "config: env.num_robots=%d  rollout=%d  num_envs=%d  updates=%d  device=%s",
         env_cfg.num_robots,
@@ -126,6 +131,14 @@ def main() -> None:
         runner_cfg.device,
     )
     runner = build_default_pipeline(env_cfg, runner_cfg, mappo_cfg)
+    if args.resume is not None:
+        import torch
+        ckpt = torch.load(args.resume, map_location=runner.device)
+        runner.actor.load_state_dict(ckpt["actor"])
+        runner.critic.load_state_dict(ckpt["critic"])
+        _LOG.info("resumed actor+critic from %s (update=%s)", args.resume, ckpt.get("update"))
+    if args.diag:
+        runner.algo.diag_print = True
     runner.train()
 
 
