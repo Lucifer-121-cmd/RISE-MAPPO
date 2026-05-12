@@ -1,0 +1,15 @@
+# Scenario 5 — communication failure. Eval loop randomly skips BCM fusion.
+# `gp.fusion_drop_rate` is consumed by the eval wrapper (not the env core)
+# so the running training pipeline is untouched.
+scenario:
+  name: "comms_failure"
+  description: "10×10 m, 5 robots, intermittent GP fusion (50% packet drop)."
+env:
+  num_robots: 5
+  world_size: 10.0
+  max_steps: 500
+  num_targets: 10
+  num_obstacles: 10
+  num_hazards: 2
+gp:
+  fusion_drop_rate: 0.5

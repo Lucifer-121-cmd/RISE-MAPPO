@@ -1,0 +1,12 @@
+# Scenario 2 — MAIN evaluation. Large cluttered world with hazards.
+scenario:
+  name: "complex"
+  description: "10×10 m, 5 robots, 10 targets, 15 obstacles, 3 hazard zones."
+env:
+  num_robots: 5
+  world_size: 10.0
+  max_steps: 500
+  num_targets: 10
+  num_obstacles: 15
+  num_hazards: 3
+  difficulty: "hard"

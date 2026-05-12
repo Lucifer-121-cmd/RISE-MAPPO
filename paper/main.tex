@@ -1,0 +1,482 @@
+\documentclass[letterpaper]{IEEEtran}
+
+% Core packages
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{xcolor}
+\usepackage{cite}
+\usepackage{balance}
+\usepackage{bm}
+\usepackage{multirow}
+
+% Custom commands
+\newcommand{\vmean}{V_{\text{mean}}}
+\newcommand{\vcvar}{V_{\text{CVaR}}}
+\newcommand{\amean}{A_{\text{mean}}}
+\newcommand{\arisk}{A_{\text{risk}}}
+\newcommand{\lrisk}{\lambda_{\text{risk}}}
+\newcommand{\xbf}{\mathbf{x}}
+\newcommand{\ubf}{\mathbf{u}}
+\newcommand{\sbf}{\mathbf{s}}
+\newcommand{\obf}{\mathbf{o}}
+\newcommand{\abf}{\mathbf{a}}
+\newcommand{\Rbb}{\mathbb{R}}
+\newcommand{\Ebb}{\mathbb{E}}
+\DeclareMathOperator{\CVaR}{CVaR}
+\DeclareMathOperator{\Var}{Var}
+
+\begin{document}
+
+\title{RISE-MAPPO: Risk-Sensitive Multi-Agent Policy Optimization for Multi-Robot Exploration}
+
+\author{Nischal Dhakal and [Supervisor Name]%
+\thanks{N. Dhakal and [Supervisor] are with the School of Automation, Chongqing University of Posts and Telecommunications, Chongqing 400065, China. E-mail: \texttt{[email]}}%
+\thanks{Manuscript received [date]; revised [date].}}
+
+\maketitle
+
+\begin{abstract}
+Cooperative search by mobile robot teams requires balancing coverage efficiency against environmental risks, yet existing multi-agent reinforcement learning methods treat all regions of the search space with equal priority regardless of uncertainty or hazard potential. We present RISE-MAPPO, a hierarchical framework that couples a risk-sensitive multi-agent policy with model-based low-level control for multi-robot cooperative search. At the planning level, a dual-head centralized critic estimates both expected returns and conditional value-at-risk, producing a risk-adjusted advantage that steers the joint policy away from catastrophic outcomes. The critic further incorporates a Gaussian-process-uncertainty-weighted attention mechanism that allocates representational capacity toward agents operating in poorly mapped regions. At the execution level, per-robot Lyapunov-stable model predictive controllers track the planned subgoals while respecting kinodynamic constraints, and a distributed Gaussian process with Bayesian committee machine fusion maintains a shared spatial belief over the environment. We evaluate RISE-MAPPO on cooperative search tasks with differential-drive robots across five scenarios of increasing complexity. \textcolor{red}{[RESULTS PLACEHOLDER: coverage, detection, collision, energy metrics vs.\ baselines]}
+\end{abstract}
+
+\begin{IEEEkeywords}
+Multi-robot systems, cooperative exploration, risk-sensitive reinforcement learning, model predictive control, Gaussian processes
+\end{IEEEkeywords}
+
+%======================================================================
+\section{Introduction}
+\label{sec:intro}
+%======================================================================
+
+Deploying teams of mobile robots to search unknown or hazardous environments arises in disaster response~\cite{murphy2016disaster}, warehouse inventory~\cite{azadeh2019robotized}, and environmental monitoring~\cite{dunbabin2012robots}. A team that can coordinate its members to cover ground quickly, detect targets reliably, and avoid dangerous zones is strictly more capable than any single robot operating alone. The coordination problem, however, is hard: each robot observes only a fraction of the world, communication may be intermittent, and the map itself is revealed incrementally through sensing.
+
+Multi-agent reinforcement learning (MARL) has become a leading approach for learning such coordination policies from experience. MAPPO~\cite{yu2022surprising}, which extends proximal policy optimization to the centralized-training--decentralized-execution paradigm, now serves as a strong baseline across cooperative benchmarks. Several recent works have applied MAPPO variants to multi-robot exploration: ACE~\cite{yu2023asynchronous} handles asynchronous decision-making and real-robot deployment, while attention-based communication methods~\cite{geng2019learning} learn which teammates to communicate with. These methods optimize expected cumulative reward and are, by construction, risk-neutral. In environments that contain hazard zones, energy constraints, or uncertain terrain, a policy that maximizes expected coverage may route robots through high-risk corridors simply because the average outcome is acceptable---even when the tail outcomes are catastrophic.
+
+Risk-sensitive MARL has received limited attention. RMIX~\cite{qiu2022rmix} introduced CVaR-based value decomposition for cooperative tasks, and RiskQ~\cite{shen2023riskq} generalized this to arbitrary distortion risk measures. Both operate within value-decomposition frameworks (QMIX) and have not been applied to spatially extended robotic exploration where environmental uncertainty is structured and observable through Gaussian process models. A separate line of work uses GPs to guide single-robot exploration~\cite{chen2024adaptive, marchant2014bayesian}, but these planners are myopic or single-agent, and do not interact with learned multi-agent coordination.
+
+A further gap lies in execution. MARL policies typically output discrete or continuous actions that are sent directly to the actuators, ignoring the robot's kinodynamic model. Hierarchical approaches that pair a learned high-level planner with a model-based low-level controller have emerged in autonomous driving~\cite{liu2024safermm, studt2025hierarchical}, but these have not been combined with risk-sensitive MARL or GP-based spatial perception for exploration tasks.
+
+We address these gaps with RISE-MAPPO, a hierarchical framework whose contributions are:
+\begin{enumerate}
+    \item A \emph{dual-head CVaR critic} for MAPPO that simultaneously estimates expected value $\vmean$ and conditional value-at-risk $\vcvar$, producing a risk-adjusted advantage $A = \amean - \lrisk \cdot \arisk$ that makes the joint policy inherently risk-averse at the optimization level rather than through indirect reward shaping (Section~\ref{sec:rise}).
+    \item A \emph{GP-uncertainty-weighted attention} mechanism in the centralized critic that modulates agent-level feature aggregation by the local Gaussian process posterior variance, directing the team's representational focus toward poorly explored or hazardous regions (Section~\ref{sec:attention}).
+    \item A \emph{hierarchical control architecture} coupling RISE-MAPPO with per-robot Lyapunov-stable MPC controllers and a distributed GP with Bayesian committee machine fusion, providing kinodynamic feasibility and provable tracking stability guarantees absent from end-to-end MARL (Section~\ref{sec:hierarchy}).
+\end{enumerate}
+
+The remainder of this paper is organized as follows. Section~\ref{sec:related} surveys related work. Section~\ref{sec:problem} formulates the cooperative search problem. Section~\ref{sec:method} presents the RISE-MAPPO framework. Section~\ref{sec:experiments} describes the experimental setup and results. Section~\ref{sec:conclusion} concludes.
+
+%======================================================================
+\section{Related Work}
+\label{sec:related}
+%======================================================================
+
+\subsection{Multi-Agent RL for Cooperative Exploration}
+
+Frontier-based exploration~\cite{yamauchi1997frontier} assigns robots to the nearest boundary between explored and unexplored space and remains a common baseline. Voronoi-based partitioning~\cite{breitenmoser2010voronoi} divides the workspace so that each robot covers its own cell, reducing redundant visits but requiring global position knowledge. Learning-based approaches have increasingly replaced these handcrafted strategies. Geng et al.~\cite{geng2019learning} proposed an attention-based communication network (CommAttn) that lets agents decide which teammates to exchange messages with; however, the method does not model environmental uncertainty and uses a risk-neutral objective. Yu et al.~\cite{yu2023asynchronous} developed ACE, extending MAPPO to asynchronous settings and demonstrating real-robot deployment, but again without risk sensitivity or spatial uncertainty modeling. Zhang and Li~\cite{zhang2025cooperative} applied MAPPO to multi-UAV target search with an exploration reward, yet their method lacks a principled mechanism for risk avoidance. PRD-MAPPO~\cite{kapoor2024prd} uses learned attention for partial reward decoupling to reduce gradient variance in large teams, while MF-MAPPO~\cite{jeloka2025meanfield} extends to mean-field settings. Neither addresses risk-sensitive objectives or incorporates perceptual uncertainty into the critic.
+
+\subsection{Risk-Sensitive Multi-Agent RL}
+
+Risk-sensitive RL optimizes a risk measure---typically CVaR---instead of or alongside the expected return~\cite{chow2014cvar}. In single-agent settings, distributional RL methods estimate the full return distribution and extract CVaR from it~\cite{dabney2018distributional, wang2023near}. Extending risk sensitivity to multi-agent settings introduces the challenge of decomposing a joint risk measure across agents. RMIX~\cite{qiu2022rmix} solves this within the QMIX framework by learning per-agent return distributions and computing CVaR for decentralized execution, with a dynamic risk-level predictor that adapts $\alpha$ over time. RiskQ~\cite{shen2023riskq} generalizes to arbitrary Wang distortion measures and proves a risk-sensitive individual-global-max (RIGM) principle. DRIMA~\cite{sun2023drima} separates cooperation risk from environmental risk. All three methods operate in value-decomposition architectures. To the best of our knowledge, no prior work integrates CVaR directly into a policy-gradient (MAPPO-style) multi-agent critic, which is the approach we take in RISE-MAPPO. The policy-gradient formulation avoids the monotonicity constraints inherent to QMIX-style decomposition and naturally accommodates continuous or large discrete action spaces.
+
+\subsection{GP-Based Exploration and Risk Assessment}
+
+Gaussian processes provide calibrated posterior uncertainty over spatial fields, making them a natural tool for informative path planning~\cite{marchant2014bayesian}. Chen et al.~\cite{chen2024adaptive} addressed non-stationary GPs for robotic information gathering, while Ott et al.~\cite{ott2024safe} used GP prediction uncertainty to define safe exploration regions. For multi-robot teams, distributed GP methods are essential. The Bayesian committee machine (BCM)~\cite{tresp2000bcm} fuses predictions from local GP experts by combining their precision-weighted means, enabling communication-efficient multi-robot mapping~\cite{cao2025multirobot}. McDonald and Egerstedt~\cite{mcdonald2021multirobot} combined GP estimation with coverage control, sequencing exploration and exploitation epochs. Our work differs in that GP uncertainty feeds directly into the MARL critic via an attention mechanism, rather than serving only as a planning heuristic. The CVaR risk computed from the GP posterior~\cite{dhakal2025gpcvar} further provides a principled tail-risk signal for the dual-head critic.
+
+\subsection{Hierarchical RL with Model-Based Low-Level Control}
+
+Pairing a learned high-level policy with a model-based controller addresses the sim-to-real gap and enforces physical constraints that end-to-end policies cannot guarantee. Liu et al.~\cite{liu2024safermm} proposed Safe-RMM, where robust MARL generates discrete plans for connected vehicles and MPC with control barrier functions ensures safety. Studt and Schildbach~\cite{studt2025hierarchical} combined MAPPO with CasADi/IPOPT-based MPC for predator-prey tasks, showing that the hierarchy outperforms end-to-end learning in both reward and safety. Lyapunov-based stability has been integrated with RL through Lyapunov-constrained policy optimization~\cite{chow2018lyapunov} and SAC-CLF~\cite{chen2025sacclf}, though these are single-agent. Our framework extends the hierarchical paradigm to multi-robot exploration with three distinguishing features: (i) the high-level policy is risk-sensitive via CVaR, (ii) the low-level MPC uses a Lyapunov contraction constraint rather than a barrier function, providing convergence guarantees to subgoals, and (iii) the GP perception layer feeds uncertainty into both the critic attention and the MPC safety margins.
+
+\begin{table}[t]
+\caption{Comparison with closely related approaches.}
+\label{tab:differentiator}
+\centering\small
+\begin{tabular}{lccccc}
+\toprule
+Method & \rotatebox{70}{Risk-Sensitive} & \rotatebox{70}{GP Uncertainty} & \rotatebox{70}{Hierarchical} & \rotatebox{70}{Lyapunov MPC} & \rotatebox{70}{Multi-Robot} \\
+\midrule
+RMIX~\cite{qiu2022rmix}          & \checkmark &            &            &            & \checkmark \\
+RiskQ~\cite{shen2023riskq}       & \checkmark &            &            &            & \checkmark \\
+ACE~\cite{yu2023asynchronous}    &            &            &            &            & \checkmark \\
+Safe-RMM~\cite{liu2024safermm}   &            &            & \checkmark & CBF        & \checkmark \\
+Studt~\cite{studt2025hierarchical} &          &            & \checkmark & \checkmark & \checkmark \\
+CommAttn~\cite{geng2019learning} &            &            &            &            & \checkmark \\
+\textbf{RISE-MAPPO (Ours)}       & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%======================================================================
+\section{Problem Formulation}
+\label{sec:problem}
+%======================================================================
+
+\subsection{Multi-Robot Cooperative Search as Dec-POMDP}
+
+We model the cooperative search task as a decentralized partially observable Markov decision process (Dec-POMDP)~\cite{oliehoek2016decentralized}, defined by the tuple $\langle \mathcal{N}, \mathcal{S}, \{\mathcal{O}_i\}, \{\mathcal{A}_i\}, T, R, \Omega, \gamma \rangle$ where $\mathcal{N} = \{1, \dots, N\}$ is the set of robots, $\mathcal{S}$ the global state space, $\mathcal{O}_i$ the local observation space of robot~$i$, $\mathcal{A}_i$ its action space, $T: \mathcal{S} \times \mathcal{A} \to \Delta(\mathcal{S})$ the transition function, $R: \mathcal{S} \times \mathcal{A} \to \Rbb$ the shared reward, $\Omega: \mathcal{S} \to \prod_i \mathcal{O}_i$ the observation function, and $\gamma \in (0,1)$ the discount factor.
+
+\subsection{Robot Dynamics}
+
+Each robot~$i$ is a TurtleBot3 Burger with unicycle kinematics:
+\begin{equation}
+\dot{\xbf}_i = \begin{bmatrix} v_i \cos\theta_i \\ v_i \sin\theta_i \\ \omega_i \end{bmatrix}, \quad
+\ubf_i = \begin{bmatrix} v_i \\ \omega_i \end{bmatrix} \in \mathcal{U},
+\label{eq:dynamics}
+\end{equation}
+where $\xbf_i = [x_i, y_i, \theta_i]^\top \in \Rbb^3$ is the pose, $v_i \in [0, v_{\max}]$ the linear velocity with $v_{\max} = 0.22$~m/s, $\omega_i \in [-\omega_{\max}, \omega_{\max}]$ the angular velocity with $\omega_{\max} = 2.84$~rad/s, and $\mathcal{U}$ the admissible control set. The discrete-time dynamics with step $\Delta t$ follow from an Euler integration of~\eqref{eq:dynamics}.
+
+\subsection{Observation and Action Spaces}
+
+At each high-level decision step $t$, robot~$i$ receives a local observation $\obf_i^t$ consisting of: (a) a local occupancy grid patch of size $P \times P$ centered at $\xbf_i$, (b) a GP posterior variance patch of the same size, (c) relative positions of other robots within communication range, (d) its own pose and remaining energy, and (e) a one-hot agent identifier. The centralized critic receives the global state $\sbf^t$, which includes the full occupancy map, the GP variance grid, all robot poses, and energy levels.
+
+Each robot's action $a_i \in \{0, 1, \dots, K{-}1\}$ selects a subgoal from a $\sqrt{K} \times \sqrt{K}$ grid covering the local neighborhood. The low-level MPC controller then tracks this subgoal over $K_s$ control steps before the next high-level decision.
+
+\subsection{Objective}
+
+Standard MAPPO maximizes the expected discounted return $J(\pi) = \Ebb_\pi \!\left[\sum_{t=0}^T \gamma^t R(\sbf^t, \abf^t)\right]$. In RISE-MAPPO, we additionally consider the CVaR of a separate risk-cost signal $c^t$ extracted from the GP posterior. The risk-sensitive objective seeks a policy that achieves high expected return while keeping the tail risk bounded:
+\begin{equation}
+\max_\pi \; J(\pi) - \lrisk \cdot \CVaR_\alpha\!\left[\textstyle\sum_{t} \gamma^t c^t\right],
+\label{eq:objective}
+\end{equation}
+where $\alpha \in (0,1)$ is the CVaR confidence level and $\lrisk \geq 0$ controls the risk--return trade-off. We approximate this objective through the risk-adjusted advantage introduced in Section~\ref{sec:rise}.
+
+%======================================================================
+\section{Proposed Method: RISE-MAPPO}
+\label{sec:method}
+%======================================================================
+
+The RISE-MAPPO framework comprises three layers operating at different temporal scales (Fig.~\ref{fig:architecture}): (1) a multi-agent planning layer that outputs subgoals every $K_s$ low-level steps, (2) a per-robot Lyapunov-MPC tracking layer that executes at the control rate, and (3) a distributed GP perception layer that maintains and fuses spatial beliefs.
+
+\begin{figure}[t]
+\centering
+\textcolor{red}{[PLACEHOLDER: System architecture diagram --- RISE-MAPPO $\to$ Lyapunov-MPC $\to$ Distributed GP]}
+\caption{RISE-MAPPO hierarchical architecture. The multi-agent planner selects subgoals every $K_s$ steps; per-robot MPC controllers track subgoals with Lyapunov stability guarantees; distributed GP with BCM fusion provides shared environmental belief.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Dual-Head CVaR Critic}
+\label{sec:rise}
+
+The standard MAPPO critic maps the global state $\sbf$ to a single scalar value $V(\sbf)$ estimating the expected discounted return. We extend this to a \emph{dual-head} architecture that outputs two value estimates from a shared feature backbone:
+\begin{equation}
+[\vmean(\sbf), \; \vcvar(\sbf)] = f_{\text{critic}}(\sbf; \phi),
+\label{eq:dual_critic}
+\end{equation}
+where $\vmean$ estimates $\Ebb[\sum \gamma^t r^t]$ and $\vcvar$ estimates $\Ebb[\sum \gamma^t c^t]$ with $c^t$ being a per-step risk cost derived from the GP-based CVaR at the robots' positions.
+
+The risk cost at step $t$ is computed from the GP posterior at each robot's location. For a Gaussian posterior $\mathcal{N}(\mu, \sigma^2)$ over hazard intensity, the analytic CVaR at confidence level $\alpha$ is~\cite{rockafellar2002conditional}:
+\begin{equation}
+\CVaR_\alpha(\mu, \sigma) = \mu + \sigma \cdot \frac{\varphi(\Phi^{-1}(\alpha))}{1 - \alpha},
+\label{eq:cvar_gaussian}
+\end{equation}
+where $\varphi$ and $\Phi$ are the standard normal PDF and CDF. The team risk cost is $c^t = \frac{1}{N}\sum_{i=1}^{N} \CVaR_\alpha(\mu_i^t, \sigma_i^t)$, normalized to $[0, 1]$ to match the reward scale.
+
+We compute separate generalized advantage estimates (GAE)~\cite{schulman2016gae} for each head:
+\begin{align}
+\amean^t &= \textstyle\sum_{l=0}^{T-t} (\gamma\lambda)^l \delta_{\text{mean}}^{t+l}, \label{eq:gae_mean} \\
+\arisk^t &= \textstyle\sum_{l=0}^{T-t} (\gamma\lambda)^l \delta_{\text{risk}}^{t+l}, \label{eq:gae_risk}
+\end{align}
+where $\delta_{\text{mean}}^t = r^t + \gamma \vmean(\sbf^{t+1}) - \vmean(\sbf^t)$ and $\delta_{\text{risk}}^t = c^t + \gamma \vcvar(\sbf^{t+1}) - \vcvar(\sbf^t)$.
+
+The \textbf{risk-adjusted advantage} that drives the policy gradient is:
+\begin{equation}
+A^t = \amean^t - \lrisk \cdot \arisk^t.
+\label{eq:risk_advantage}
+\end{equation}
+A positive $\arisk^t$ indicates that the current policy leads to higher-than-predicted risk cost from this state onward; the subtraction penalizes such trajectories in the policy update. The coefficient $\lrisk$ trades off exploration efficiency against risk aversion. When $\lrisk = 0$, the algorithm reduces to standard MAPPO.
+
+The critic is trained with a combined loss:
+\begin{equation}
+\mathcal{L}_{\text{critic}} = \mathcal{L}_{\vmean}(\phi) + \beta \cdot \mathcal{L}_{\vcvar}(\phi),
+\label{eq:critic_loss}
+\end{equation}
+where $\mathcal{L}_{\vmean}$ and $\mathcal{L}_{\vcvar}$ are clipped value losses targeting the mean returns and risk returns respectively, and $\beta$ controls the relative weight of the CVaR head. Each head maintains its own PopArt~\cite{van2016learning} normalizer to handle different output scales.
+
+\subsection{GP-Uncertainty-Weighted Attention}
+\label{sec:attention}
+
+Standard MAPPO critics aggregate per-agent features through concatenation or mean-pooling, treating all agents identically. In spatial exploration, an agent operating at the boundary of the known map contributes more decision-relevant information than one revisiting well-mapped terrain. We encode this asymmetry through an uncertainty-modulated attention mechanism.
+
+Let $\mathbf{h}_i \in \Rbb^d$ be the feature vector for agent~$i$ extracted from the shared backbone, and let $\sigma_i$ be the GP posterior standard deviation at robot~$i$'s position. The attention weight for agent~$i$ is:
+\begin{equation}
+w_i = \frac{\exp\!\big(\mathbf{q}^\top \mathbf{h}_i \cdot (1 + \eta \, \tilde{\sigma}_i)\big)}{\sum_{j=1}^{N} \exp\!\big(\mathbf{q}^\top \mathbf{h}_j \cdot (1 + \eta \, \tilde{\sigma}_j)\big)},
+\label{eq:attention}
+\end{equation}
+where $\mathbf{q} \in \Rbb^d$ is a learnable query vector, $\tilde{\sigma}_i = \sigma_i / \max_j \sigma_j$ is the normalized uncertainty, and $\eta \geq 0$ is a temperature hyperparameter controlling the strength of the uncertainty modulation. When $\eta = 0$, the mechanism reduces to standard dot-product attention.
+
+The attended global feature is:
+\begin{equation}
+\mathbf{g} = \textstyle\sum_{i=1}^{N} w_i \, \mathbf{h}_i,
+\label{eq:attended}
+\end{equation}
+which is then fed to both the $\vmean$ and $\vcvar$ heads. This design requires no additional communication beyond what CTDE already provides (all agent features are available to the centralized critic during training) and adds negligible computational cost since the attention is a single softmax over $N$ agents.
+
+\subsection{Lyapunov-Stable MPC Tracking}
+\label{sec:mpc}
+
+Each robot tracks its assigned subgoal using a nonlinear MPC formulated in CasADi~\cite{andersson2019casadi} and solved with IPOPT~\cite{wachter2006ipopt}. The MPC minimizes a tracking cost over a horizon $H$ subject to dynamics, input bounds, and a Lyapunov contraction constraint:
+\begin{subequations}
+\label{eq:mpc}
+\begin{align}
+\min_{\ubf_{0:H-1}} &\; \sum_{k=0}^{H-1} \left[\|\xbf_k - \xbf_g\|_Q^2 + \|\ubf_k\|_R^2\right] + \|\xbf_H - \xbf_g\|_{Q_f}^2 \label{eq:mpc_cost} \\
+\text{s.t.} \quad & \xbf_{k+1} = f(\xbf_k, \ubf_k), \quad k = 0, \dots, H{-}1, \label{eq:mpc_dyn} \\
+& \ubf_k \in \mathcal{U}, \label{eq:mpc_input} \\
+& V(\xbf_{k+1}) \leq (1 - \alpha_L) V(\xbf_k), \label{eq:mpc_lyap}
+\end{align}
+\end{subequations}
+where $\xbf_g$ is the subgoal, $Q$, $R$, $Q_f$ are weight matrices, and $V(\xbf) = \|\xbf - \xbf_g\|^2$ is a quadratic Lyapunov candidate. The contraction constraint~\eqref{eq:mpc_lyap} with rate $\alpha_L \in (0, 1)$ guarantees that the tracking error decreases monotonically, providing a formal stability certificate.
+
+The NLP is built once at initialization using CasADi symbolic expressions; only the parameter values (current state, subgoal, obstacles) change at each control step. Warm-starting with the previous solution shifted by one timestep reduces solve times.
+
+Obstacle safety margins are computed from the GP-CVaR: for obstacle $j$ with GP posterior $\mathcal{N}(\hat{d}_j, \sigma_j^2)$ over the distance, the safety margin is $d_{\text{safe},j} = \hat{d}_j - \CVaR_\alpha(\hat{d}_j, \sigma_j)$, tightening the constraint in regions of high uncertainty.
+
+\subsection{Distributed GP with BCM Fusion}
+\label{sec:gp}
+
+Each robot~$i$ maintains a local sparse GP~\cite{titsias2009variational} that models the spatial field (occupancy likelihood and hazard intensity) from its own sensor observations. The GP uses a squared-exponential kernel with hyperparameters shared across robots.
+
+To construct a team-wide belief without centralizing raw data, we apply the Bayesian committee machine~\cite{tresp2000bcm}. At each fusion step, robot~$i$ broadcasts its local predictive distribution $\mathcal{N}(\mu_i^*, {\sigma_i^*}^2)$ at a set of inducing points. The fused prediction at test point $\xbf_*$ is:
+\begin{align}
+\sigma_{\text{BCM}}^{-2}(\xbf_*) &= \textstyle\sum_{i=1}^{N} {\sigma_i^*}^{-2}(\xbf_*) - (N{-}1)\,\sigma_{\text{prior}}^{-2}(\xbf_*), \label{eq:bcm_var} \\
+\mu_{\text{BCM}}(\xbf_*) &= \sigma_{\text{BCM}}^2(\xbf_*) \textstyle\sum_{i=1}^{N} {\sigma_i^*}^{-2}(\xbf_*)\,\mu_i^*(\xbf_*), \label{eq:bcm_mean}
+\end{align}
+where $\sigma_{\text{prior}}^2$ is the prior variance. BCM fusion requires transmitting only the predictive statistics at inducing points, keeping the communication bandwidth independent of the number of raw observations.
+
+The fused GP provides three signals consumed by other layers: (i) a variance grid $\bm{\Sigma}$ that enters the critic observation and the attention mechanism, (ii) information gain $\mathcal{I}(\xbf) = \frac{1}{2}\log(\sigma_{\text{prior}}^2 / \sigma_{\text{BCM}}^2(\xbf))$ that enters the reward, and (iii) CVaR risk at robot positions via~\eqref{eq:cvar_gaussian} that enters both the reward and the dual-head critic as the risk cost $c^t$.
+
+\subsection{Hierarchical Integration}
+\label{sec:hierarchy}
+
+Algorithm~\ref{alg:rise} summarizes the online execution loop. Every $K_s$ low-level steps, the MARL policy selects subgoals for all robots. Between decisions, each robot's MPC tracks its subgoal, the local GPs ingest sensor data, and BCM fusion updates the shared belief. The critic is trained using the risk-adjusted advantage~\eqref{eq:risk_advantage}, with the risk cost derived from the fused GP. The actor is trained with a standard PPO clipped surrogate using the risk-adjusted advantage.
+
+\begin{algorithm}[t]
+\caption{RISE-MAPPO Online Execution}
+\label{alg:rise}
+\begin{algorithmic}[1]
+\REQUIRE Trained actor $\pi_\theta$, MPC controllers, local GPs
+\FOR{each episode}
+    \STATE Reset environment, GPs, MPC warm-starts
+    \FOR{$t = 0, K_s, 2K_s, \dots$}
+        \STATE $\obf_i^t \gets$ local observation for each robot $i$
+        \STATE $\abf^t \gets \pi_\theta(\obf_1^t, \dots, \obf_N^t)$ \hfill \COMMENT{Select subgoals}
+        \FOR{$k = 0, \dots, K_s - 1$}
+            \FOR{each robot $i$}
+                \STATE $\ubf_i \gets \text{MPC}_i(\xbf_i, \xbf_{g,i}, \text{obstacles})$
+                \STATE Apply $\ubf_i$; update local GP$_i$ with sensor data
+            \ENDFOR
+        \ENDFOR
+        \STATE BCM fusion $\to$ update $\mu_{\text{BCM}}, \sigma_{\text{BCM}}$
+        \STATE Compute $c^t$ via~\eqref{eq:cvar_gaussian} from fused GP
+    \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+%======================================================================
+\section{Experiments}
+\label{sec:experiments}
+%======================================================================
+
+\textcolor{red}{\textbf{[THIS SECTION WILL BE COMPLETED AFTER TRAINING AND EVALUATION]}}
+
+\subsection{Experimental Setup}
+
+We evaluate RISE-MAPPO in a custom multi-robot search environment implemented in Python with Gymnasium. The robots follow the TurtleBot3 Burger kinematic model~\eqref{eq:dynamics} with parameters listed in Table~\ref{tab:params}. The MPC is formulated in CasADi and solved with IPOPT. Local GPs use GPyTorch with 50 inducing points and a squared-exponential kernel.
+
+\begin{table}[t]
+\caption{Simulation and training parameters.}
+\label{tab:params}
+\centering\small
+\begin{tabular}{lll}
+\toprule
+Parameter & Symbol & Value \\
+\midrule
+Max linear velocity & $v_{\max}$ & 0.22 m/s \\
+Max angular velocity & $\omega_{\max}$ & 2.84 rad/s \\
+Control timestep & $\Delta t$ & 0.1 s \\
+Subgoal interval & $K_s$ & 25 steps \\
+MPC horizon & $H$ & 20 steps \\
+Lyapunov contraction rate & $\alpha_L$ & 0.1 \\
+CVaR confidence level & $\alpha$ & 0.05 \\
+Risk penalty weight & $\lrisk$ & 0.05 \\
+CVaR head loss weight & $\beta$ & 0.25 \\
+GP attention temperature & $\eta$ & 0.5 \\
+Discount factor & $\gamma$ & 0.99 \\
+GAE parameter & $\lambda$ & 0.95 \\
+PPO clip & $\epsilon$ & 0.2 \\
+Max gradient norm & & 0.5 \\
+Number of robots & $N$ & 3--8 \\
+World size & & 10$\times$10 m \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Scenarios}
+\textcolor{red}{[Five scenarios: Simple (3 robots, 5 targets), Complex (5 robots, 10 targets, corridors + hazards), Scalability (vary $N$ from 3 to 8), Energy-constrained (half energy budget), Communication failure (50\% GP fusion drop rate)]}
+
+\subsubsection{Baselines}
+We compare against:
+\begin{itemize}
+    \item \textbf{Random}: uniform random subgoal selection (lower bound).
+    \item \textbf{Nearest Frontier}~\cite{yamauchi1997frontier}: each robot moves to closest frontier cell.
+    \item \textbf{Voronoi Partition}~\cite{breitenmoser2010voronoi}: each robot explores within its Voronoi cell.
+    \item \textbf{MAPPO}~\cite{yu2022surprising}: standard MAPPO without risk sensitivity or GP attention.
+\end{itemize}
+
+\subsubsection{Ablation Variants}
+\begin{itemize}
+    \item \textbf{Ours w/o CVaR}: $\lrisk = 0$, $\beta = 0$ (removes dual-head risk critic).
+    \item \textbf{Ours w/o GP-Attn}: $\eta = 0$ (removes uncertainty-weighted attention).
+    \item \textbf{Ours w/o Lyap}: proportional controller replaces MPC (removes stability guarantee).
+\end{itemize}
+
+\subsubsection{Evaluation Metrics}
+\textcolor{red}{[Coverage rate, detection success rate, collision rate, energy efficiency, mean CVaR risk, exploration overlap, Lyapunov stability (monotonic fraction). 50 episodes per scenario, 5 seeds. Statistical testing: Wilcoxon signed-rank with Cliff's delta effect size.]}
+
+\subsection{Main Results}
+\textcolor{red}{[Table~III: main comparison across all baselines on Complex scenario. Coverage curves (Fig.~X). Discussion of risk--return trade-off.]}
+
+\subsection{Ablation Study}
+\textcolor{red}{[Table~IV: ablation results. Each component's individual contribution. Bar chart (Fig.~X).]}
+
+\subsection{Scalability Analysis}
+\textcolor{red}{[Performance vs.\ number of robots (Fig.~X). Computational overhead analysis: MPC solve time, GP update time, per-update training time.]}
+
+\subsection{Communication Robustness}
+\textcolor{red}{[Results under 50\% GP fusion drop rate. Comparison with non-distributed approaches.]}
+
+%======================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%======================================================================
+
+We presented RISE-MAPPO, a hierarchical framework for risk-sensitive multi-robot cooperative search. The dual-head CVaR critic produces a risk-adjusted advantage that penalizes catastrophic trajectories at the policy optimization level, while the GP-uncertainty-weighted attention directs the critic's representational focus toward agents in poorly explored regions. Per-robot Lyapunov-MPC controllers provide kinodynamic feasibility and provable tracking convergence, and distributed GP with BCM fusion maintains a communication-efficient shared environmental model.
+
+\textcolor{red}{[RESULTS SUMMARY: quantitative improvements over baselines. Ablation confirms each component's contribution.]}
+
+\textbf{Limitations.} The current evaluation uses a 2D simulated environment with idealized sensing. The GP kernel hyperparameters are fixed rather than adapted online, which may limit performance in highly heterogeneous environments. The Lyapunov contraction constraint can become infeasible near obstacle boundaries, requiring a fallback to softer constraints.
+
+\textbf{Future work.} Deployment on physical TurtleBot3 robots via ROS\,2 is planned. Extending the CVaR formulation to risk-sensitive communication scheduling, where agents decide not only where to explore but also when to share GP data based on the marginal value of information, is a promising direction.
+
+%======================================================================
+% References
+%======================================================================
+\bibliographystyle{IEEEtran}
+% \bibliography{references}
+
+% Inline references for draft (replace with .bib for submission)
+\begin{thebibliography}{35}
+
+\bibitem{murphy2016disaster}
+R.~R. Murphy, ``Disaster robotics,'' MIT Press, 2014.
+
+\bibitem{azadeh2019robotized}
+K.~Azadeh, R.~De~Koster, and D.~Roy, ``Robotized and automated warehouse systems: Review and recent developments,'' \emph{Transportation Science}, vol.~53, no.~4, pp.~917--945, 2019.
+
+\bibitem{dunbabin2012robots}
+M.~Dunbabin and L.~Marques, ``Robots for environmental monitoring: Significant advancements and applications,'' \emph{IEEE Robot. Autom. Mag.}, vol.~19, no.~1, pp.~24--39, 2012.
+
+\bibitem{yu2022surprising}
+C.~Yu, A.~Velu, E.~Vinitsky, J.~Gao, Y.~Wang, A.~Baez, and Y.~Wu, ``The surprising effectiveness of PPO in cooperative multi-agent games,'' in \emph{Proc. NeurIPS}, 2022.
+
+\bibitem{yu2023asynchronous}
+C.~Yu \emph{et~al.}, ``Asynchronous multi-agent reinforcement learning for efficient real-time multi-robot cooperative exploration,'' in \emph{Proc. AAMAS}, 2023.
+
+\bibitem{geng2019learning}
+M.~Geng, K.~Xu, X.~Zhou, B.~Ding, H.~Wang, and L.~Zhang, ``Learning to cooperate via an attention-based communication neural network in decentralized multi-robot exploration,'' \emph{Entropy}, vol.~21, no.~3, p.~294, 2019.
+
+\bibitem{qiu2022rmix}
+W.~Qiu, X.~Wang, R.~Yu, X.~He, R.~Wang, B.~An, S.~Obraztsova, and Z.~Rabinovich, ``RMIX: Learning risk-sensitive policies for cooperative reinforcement learning agents,'' in \emph{Proc. NeurIPS}, 2021.
+
+\bibitem{shen2023riskq}
+J.~Shen \emph{et~al.}, ``RiskQ: Risk-sensitive multi-agent reinforcement learning value factorization,'' in \emph{Proc. NeurIPS}, 2023.
+
+\bibitem{chen2024adaptive}
+W.~Chen, R.~Khardon, and L.~Liu, ``Adaptive robotic information gathering via non-stationary Gaussian processes,'' \emph{Int. J. Robot. Res.}, vol.~43, no.~4, pp.~405--425, 2024.
+
+\bibitem{marchant2014bayesian}
+R.~Marchant and F.~Ramos, ``Bayesian optimisation for informative continuous path planning,'' in \emph{Proc. IEEE ICRA}, 2014.
+
+\bibitem{liu2024safermm}
+X.~Liu \emph{et~al.}, ``Safety guaranteed robust multi-agent reinforcement learning with hierarchical control for connected and automated vehicles,'' \emph{arXiv:2309.11057}, 2024.
+
+\bibitem{studt2025hierarchical}
+M.~Studt and G.~Schildbach, ``Hierarchical reinforcement learning with low-level MPC for multi-agent control,'' \emph{arXiv:2509.15799}, 2025.
+
+\bibitem{kapoor2024prd}
+S.~Kapoor \emph{et~al.}, ``PRD-MAPPO: Partial reward decoupling in MAPPO,'' in \emph{Proc. AAMAS}, 2024.
+
+\bibitem{jeloka2025meanfield}
+A.~Jeloka \emph{et~al.}, ``MF-MAPPO: Mean-field MAPPO for large-scale multi-agent systems,'' \emph{arXiv}, 2025.
+
+\bibitem{chow2014cvar}
+Y.~Chow and M.~Ghavamzadeh, ``Algorithms for CVaR optimization in MDPs,'' in \emph{Proc. NeurIPS}, 2014.
+
+\bibitem{dabney2018distributional}
+W.~Dabney, M.~Rowland, M.~G. Bellemare, and R.~Munos, ``Distributional reinforcement learning with quantile regression,'' in \emph{Proc. AAAI}, 2018.
+
+\bibitem{wang2023near}
+K.~Wang, N.~Kallus, and W.~Sun, ``Near-minimax-optimal risk-sensitive reinforcement learning with CVaR,'' \emph{arXiv:2302.03201}, 2023.
+
+\bibitem{sun2023drima}
+Q.~Sun \emph{et~al.}, ``DRIMA: Distributional risk-sensitive MARL with monotonic mixing,'' in \emph{Proc. AAAI}, 2023.
+
+\bibitem{rockafellar2002conditional}
+R.~T. Rockafellar and S.~Uryasev, ``Conditional value-at-risk for general loss distributions,'' \emph{J. Banking \& Finance}, vol.~26, no.~7, pp.~1443--1471, 2002.
+
+\bibitem{tresp2000bcm}
+V.~Tresp, ``A Bayesian committee machine,'' \emph{Neural Computation}, vol.~12, no.~11, pp.~2719--2741, 2000.
+
+\bibitem{cao2025multirobot}
+K.~Cao \emph{et~al.}, ``Multi-robot area coverage and source localization method based on variational sparse Gaussian process,'' \emph{Robotica}, vol.~43, no.~6, pp.~2100--2120, 2025.
+
+\bibitem{mcdonald2021multirobot}
+A.~McDonald and M.~Egerstedt, ``Multi-robot Gaussian process estimation and coverage: A deterministic sequencing algorithm and regret analysis,'' \emph{arXiv:2101.04306}, 2021.
+
+\bibitem{dhakal2025gpcvar}
+N.~Dhakal \emph{et~al.}, ``GP-CVaR-MPC: Risk-aware model predictive control with Gaussian process prediction for mobile robot navigation,'' \emph{submitted to IEEE Trans. Ind. Informat.}, 2025.
+
+\bibitem{chow2018lyapunov}
+Y.~Chow, O.~Nachum, E.~Duenez-Guzman, and M.~Ghavamzadeh, ``A Lyapunov-based approach to safe reinforcement learning,'' in \emph{Proc. NeurIPS}, 2018.
+
+\bibitem{chen2025sacclf}
+D.~Chen \emph{et~al.}, ``Stability enhancement in reinforcement learning via adaptive control Lyapunov function,'' \emph{arXiv:2504.19473}, 2025.
+
+\bibitem{oliehoek2016decentralized}
+F.~A. Oliehoek and C.~Amato, \emph{A Concise Introduction to Decentralized POMDPs}. Springer, 2016.
+
+\bibitem{schulman2016gae}
+J.~Schulman, P.~Moritz, S.~Levine, M.~Jordan, and P.~Abbeel, ``High-dimensional continuous control using generalized advantage estimation,'' in \emph{Proc. ICLR}, 2016.
+
+\bibitem{van2016learning}
+H.~van Hasselt \emph{et~al.}, ``Learning values across many orders of magnitude,'' in \emph{Proc. NeurIPS}, 2016.
+
+\bibitem{titsias2009variational}
+M.~K. Titsias, ``Variational learning of inducing variables in sparse Gaussian processes,'' in \emph{Proc. AISTATS}, 2009.
+
+\bibitem{andersson2019casadi}
+J.~A.~E. Andersson, J.~Gillis, G.~Horn, J.~B. Rawlings, and M.~Diehl, ``CasADi: A software framework for nonlinear optimization and optimal control,'' \emph{Math. Prog. Comp.}, vol.~11, pp.~1--36, 2019.
+
+\bibitem{wachter2006ipopt}
+A.~W{\"a}chter and L.~T. Biegler, ``On the implementation of an interior-point filter line-search algorithm for large-scale nonlinear programming,'' \emph{Math. Prog.}, vol.~106, pp.~25--57, 2006.
+
+\bibitem{yamauchi1997frontier}
+B.~Yamauchi, ``A frontier-based approach for autonomous exploration,'' in \emph{Proc. IEEE CIRA}, 1997.
+
+\bibitem{breitenmoser2010voronoi}
+A.~Breitenmoser, M.~Schwager, J.-C. Metzger, R.~Siegwart, and D.~Rus, ``Voronoi coverage of non-convex environments with a group of networked robots,'' in \emph{Proc. IEEE ICRA}, 2010.
+
+\bibitem{zhang2025cooperative}
+P.~Zhang and G.~Li, ``A cooperative dynamic target search approach for multi-UAV systems utilizing the MAPPO algorithm,'' \emph{Discover Artif. Intell.}, vol.~5, p.~153, 2025.
+
+\bibitem{ott2024safe}
+F.~Ott \emph{et~al.}, ``Planning under uncertainty for safe robot exploration using Gaussian process prediction,'' \emph{Auton. Robots}, vol.~48, no.~7, p.~18, 2024.
+
+\end{thebibliography}
+
+\end{document}

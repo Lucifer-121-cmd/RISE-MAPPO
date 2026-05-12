@@ -1,0 +1,12 @@
+# Scenario 1 — small open world. Fast smoke baseline.
+scenario:
+  name: "simple"
+  description: "Open 5×5 m world, 3 robots, 5 targets, few obstacles."
+env:
+  num_robots: 3
+  world_size: 5.0
+  max_steps: 300
+  num_targets: 5
+  num_obstacles: 3
+  num_hazards: 0
+  difficulty: "easy"

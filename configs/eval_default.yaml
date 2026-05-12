@@ -1,0 +1,9 @@
+# Default evaluation configuration. Overrides via CLI flags.
+eval:
+  num_episodes: 50           # episodes per (policy, scenario) cell
+  deterministic: true         # argmax for trained policies
+  device: "cpu"               # MUST stay CPU while training holds the GPU
+  save_trajectories: true     # persist per-episode .npz blobs for re-plotting
+  save_videos: false          # off; enable post-training
+  results_dir: "results/eval"
+  seeds: [100, 200, 300, 400, 500]

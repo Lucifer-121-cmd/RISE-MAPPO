@@ -1,0 +1,12 @@
+# Scenario 4 — tight energy budget forces efficient coordination.
+scenario:
+  name: "energy_constrained"
+  description: "10×10 m, 5 robots, 10 targets, half-default energy budget."
+env:
+  num_robots: 5
+  world_size: 10.0
+  max_steps: 500
+  num_targets: 10
+  num_obstacles: 10
+  num_hazards: 2
+  energy_budget: 50.0

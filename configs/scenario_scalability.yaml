@@ -1,0 +1,12 @@
+# Scenario 3 — vary num_robots. Eval loop sweeps `scenario.robot_counts`.
+scenario:
+  name: "scalability"
+  description: "Fixed 10×10 m world; sweep robots from 3 to 8."
+  robot_counts: [3, 4, 5, 6, 7, 8]
+env:
+  num_robots: 3        # placeholder; overridden by the sweep
+  world_size: 10.0
+  max_steps: 500
+  num_targets: 10
+  num_obstacles: 10
+  num_hazards: 2
