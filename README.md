@@ -254,7 +254,7 @@ TurtleBot3 Burger with unicycle kinematics:
 @article{dhakal2026rise,
   title={{RISE-MAPPO}: Risk-Sensitive Multi-Agent Policy Optimization 
          for Multi-Robot Exploration},
-  author={Dhakal, Nischal and {Supervisor}},
+  author={Dhakal, Nischal and {Shuaiyong Li}},
   journal={submitted to IEEE Robotics and Automation Letters},
   year={2026}
 }
