@@ -9,7 +9,7 @@
 A hierarchical framework coupling risk-sensitive multi-agent reinforcement learning with model-based control for cooperative robotic search in unknown environments.
 
 <p align="center">
-  <img src="paper/fig/architecture.pdf" alt="RISE-MAPPO Architecture" width="100%">
+  <img src="paper/fig/architecture.jpg" alt="RISE-MAPPO Architecture" width="100%">
 </p>
 
 ---
