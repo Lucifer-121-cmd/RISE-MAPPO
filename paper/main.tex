@@ -152,12 +152,12 @@ where $\alpha \in (0,1)$ is the CVaR confidence level and $\lrisk \geq 0$ contro
 
 The RISE-MAPPO framework comprises three layers operating at different temporal scales (Fig.~\ref{fig:architecture}): (1) a multi-agent planning layer that outputs subgoals every $K_s$ low-level steps, (2) a per-robot Lyapunov-MPC tracking layer that executes at the control rate, and (3) a distributed GP perception layer that maintains and fuses spatial beliefs.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\textcolor{red}{[PLACEHOLDER: System architecture diagram --- RISE-MAPPO $\to$ Lyapunov-MPC $\to$ Distributed GP]}
+\includegraphics[width=\textwidth]{fig/fig1_architecture_v5.pdf}
 \caption{RISE-MAPPO hierarchical architecture. The multi-agent planner selects subgoals every $K_s$ steps; per-robot MPC controllers track subgoals with Lyapunov stability guarantees; distributed GP with BCM fusion provides shared environmental belief.}
 \label{fig:architecture}
-\end{figure}
+\end{figure*}
 
 \subsection{Dual-Head CVaR Critic}
 \label{sec:rise}
