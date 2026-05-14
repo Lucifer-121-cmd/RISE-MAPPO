@@ -5,12 +5,7 @@ reference_code/
 __pycache__/
 .pytest_cache/
 
-# Files
-CLAUDE_CODE_PROMPT.md
-PHASE2_CLAUDE_CODE_PROMPT.md
-PHASE2_5_RISE_MAPPO_PROMPT.md
-PHASE3_EVAL_BASELINES_PROMPT.md
-PHASE3B_MULTISEED_FINAL.md
+
 # Python compiled files
 *.pyc
 *.pyo
