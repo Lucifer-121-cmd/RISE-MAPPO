@@ -12,6 +12,7 @@ Phase-1 MAPPO.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict
 
@@ -23,6 +24,9 @@ from marl.mappo.buffer import RolloutBuffer
 from marl.mappo.critic import Critic
 
 
+_LOG = logging.getLogger("paper3.mappo")
+
+
 @dataclass
 class MAPPOConfig:
     actor_lr: float = 5.0e-4
@@ -31,16 +35,15 @@ class MAPPOConfig:
     clip_param: float = 0.2
     value_loss_coef: float = 0.5
     entropy_coef: float = 0.01
-    max_grad_norm: float = 10.0
+    max_grad_norm: float = 0.5  # FIXED: was 10.0, now matches default.yaml
     num_mini_batch: int = 4
     use_popart: bool = True
     # RISE-MAPPO settings.
     use_rise: bool = False
-    lambda_risk: float = 0.1
-    cvar_loss_coef: float = 0.5
-    gp_attention_eta: float = 1.0
+    lambda_risk: float = 0.05  # FIXED: was 0.1, now matches default.yaml
+    cvar_loss_coef: float = 0.25  # FIXED: was 0.5, now matches default.yaml
+    gp_attention_eta: float = 0.5  # FIXED: was 1.0, now matches default.yaml
     gp_attention_heads: int = 1
-
 
 class MAPPO:
     """Vanilla MAPPO with shared parameters across agents."""
@@ -204,16 +207,14 @@ class MAPPO:
                     )
                 rmn = _stat(returns_mean)
                 rrk = _stat(returns_risk)
-                print(
+                _LOG.debug(
                     f"[DIAG upd={self._update_count}] PRE-NAN ret_mean min/max/mean={rmn[0]:.3g}/{rmn[1]:.3g}/{rmn[2]:.3g} "
                     f"nan={rmn[3]} inf={rmn[4]} | ret_risk min/max/mean={rrk[0]:.3g}/{rrk[1]:.3g}/{rrk[2]:.3g} "
-                    f"nan={rrk[3]} inf={rrk[4]}",
-                    flush=True,
+                    f"nan={rrk[3]} inf={rrk[4]}"
                 )
-                print(
+                _LOG.debug(
                     f"[DIAG upd={self._update_count}] PopArt mean: mu={float(pm.mean):.4g} sigma={float(pm.std):.4g} debias={float(pm.debias):.4g} | "
-                    f"PopArt cvar: mu={float(pc.mean):.4g} sigma={float(pc.std):.4g} debias={float(pc.debias):.4g}",
-                    flush=True,
+                    f"PopArt cvar: mu={float(pc.mean):.4g} sigma={float(pc.std):.4g} debias={float(pc.debias):.4g}"
                 )
         # Sanitise inputs: a single NaN slipping in (e.g. from a previously
         # NaN-poisoned PopArt buffer) would otherwise wreck params here.
@@ -246,10 +247,9 @@ class MAPPO:
             with torch.no_grad():
                 vm = v_mean_pred
                 vc = v_cvar_pred
-                print(
+                _LOG.debug(
                     f"[DIAG upd={self._update_count}] v_mean_pred min/max/mean={float(vm.min()):.4g}/{float(vm.max()):.4g}/{float(vm.mean()):.4g} | "
-                    f"v_cvar_pred min/max/mean={float(vc.min()):.4g}/{float(vc.max()):.4g}/{float(vc.mean()):.4g}",
-                    flush=True,
+                    f"v_cvar_pred min/max/mean={float(vc.min()):.4g}/{float(vc.max()):.4g}/{float(vc.mean()):.4g}"
                 )
         v_mean_loss = self._value_loss(
             v_mean_pred, old_values_mean, returns_mean, self.critic.popart_mean,
@@ -258,9 +258,8 @@ class MAPPO:
             v_cvar_pred, old_values_cvar, returns_risk, self.critic.popart_cvar,
         )
         if first_mb:
-            print(
-                f"[DIAG upd={self._update_count}] RAW LOSS v_mean={float(v_mean_loss):.6g} v_cvar={float(v_cvar_loss):.6g}",
-                flush=True,
+            _LOG.debug(
+                f"[DIAG upd={self._update_count}] RAW LOSS v_mean={float(v_mean_loss):.6g} v_cvar={float(v_cvar_loss):.6g}"
             )
         value_loss = v_mean_loss + self.cfg.cvar_loss_coef * v_cvar_loss
         critic_total = self.cfg.value_loss_coef * value_loss
@@ -269,9 +268,8 @@ class MAPPO:
             critic_total.backward()
             pre_clip_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.max_grad_norm)
             if first_mb:
-                print(
-                    f"[DIAG upd={self._update_count}] critic grad_norm (pre-clip)={float(pre_clip_norm):.6g} max_grad_norm={self.cfg.max_grad_norm}",
-                    flush=True,
+                _LOG.debug(
+                    f"[DIAG upd={self._update_count}] critic grad_norm (pre-clip)={float(pre_clip_norm):.6g} max_grad_norm={self.cfg.max_grad_norm}"
                 )
             if all(p.grad is None or torch.isfinite(p.grad).all() for p in self.critic.parameters()):
                 self.critic_optim.step()

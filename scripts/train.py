@@ -51,6 +51,19 @@ def _make_env_cfg(raw: Dict[str, Any], seed: int) -> EnvConfig:
         energy_budget=env_raw.get("energy_budget", 100.0),
         add_noise=env_raw.get("add_noise", False),
         use_dynamic_step=env_raw.get("use_dynamic_step", False),
+        # Phase-2 environment toggles — required for RISE-MAPPO CVaR critic head
+        # and GP-uncertainty attention to train on real GP posterior data rather
+        # than the synthetic Phase-1 decay grid.
+        use_real_gp=env_raw.get("use_real_gp", False),
+        use_lyap_mpc=env_raw.get("use_lyap_mpc", False),
+        gp_update_interval=env_raw.get("gp_update_interval", 10),
+        gp_obs_noise_std=env_raw.get("gp_obs_noise_std", 0.05),
+        cvar_alpha=env_raw.get("cvar_alpha", 0.95),
+        obstacle_margin_scale=env_raw.get("obstacle_margin_scale", 0.2),
+        # MPC parameters live at the top-level 'mpc' key in YAML (outside 'env').
+        # Pass them through so _make_controller() receives the configured values
+        # rather than LyapunovMPCConfig dataclass defaults.
+        mpc=raw.get("mpc", {}),
         seed=seed,
         w_coverage=rew.get("w_coverage", 1.0),
         w_detection=rew.get("w_detection", 5.0),

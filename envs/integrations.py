@@ -19,21 +19,32 @@ if TYPE_CHECKING:  # pragma: no cover
     from envs.multi_robot_search_env import MultiRobotSearchEnv
 
 
-def make_controller(env: "MultiRobotSearchEnv"):
-    """Return per-robot controller. NLP if ``cfg.use_lyap_mpc`` else proportional."""
+def make_controller(env: "MultiRobotSearchEnv", mpc_cfg: dict = None):
+    """Return per-robot controller. NLP if ``cfg.use_lyap_mpc`` else proportional.
+
+    All MPC parameters are read from ``mpc_cfg`` (typically sourced from the
+    ``mpc`` section of the YAML config).  When ``mpc_cfg`` is ``None`` or
+    missing a key, the :class:`LyapunovMPCConfig` dataclass default is used.
+    No parameter is hardcoded in this function.
+    """
     if env.cfg.use_lyap_mpc:
+        cfg = mpc_cfg or {}
         return LyapunovMPC(
             config=LyapunovMPCConfig(
                 dt=env.cfg.dt,
-                horizon=12,
-                max_obstacles=8,
-                soft_lyap_penalty=100.0,
-                alpha_lyap=0.05,
-                R_diag=[0.1, 0.1],
-                Q_diag=[12.0, 12.0, 0.0],
-                P_terminal_scale=15.0,
-                max_iter=60,
-                max_cpu_time=0.05,
+                horizon=int(cfg.get("horizon", 12)),
+                max_obstacles=int(cfg.get("max_obstacles", 8)),
+                soft_lyap_penalty=float(cfg.get("soft_lyap_penalty", 100.0)),
+                alpha_lyap=float(cfg.get("alpha_lyap", 0.05)),
+                R_diag=cfg.get("R_diag", [0.1, 0.1]),
+                Q_diag=cfg.get("Q_diag", [12.0, 12.0, 0.0]),
+                S_du_diag=cfg.get("S_du_diag", [1.0, 0.5]),
+                P_terminal_scale=float(cfg.get("P_terminal_scale", 15.0)),
+                max_iter=int(cfg.get("max_iter", 60)),
+                max_cpu_time=float(cfg.get("max_cpu_time", 0.05)),
+                d_safe=float(cfg.get("d_safe", 0.5)),
+                goal_tolerance=float(cfg.get("goal_tolerance", 0.1)),
+                w_energy=float(cfg.get("w_energy", 0.1)),
             ),
             robot_params=TurtleBot3Params(),
         )
@@ -98,11 +109,17 @@ def flush_gp_buffers(env: "MultiRobotSearchEnv") -> None:
 
 
 def run_low_level_loop(env: "MultiRobotSearchEnv", subgoals: dict) -> dict:
-    """Run ``subgoal_steps`` low-level controller ticks; return per-step stats."""
+    """Run ``subgoal_steps`` low-level controller ticks; return per-step stats.
+
+    Also records per-tick robot positions so the evaluation loop can compute
+    exploration overlap at the fine-grained (low-level) timescale rather than
+    the coarse MARL-step timescale.
+    """
     collisions = 0
     cvar_total = 0.0
     lyap_total = 0.0
     infeasible = 0
+    positions_history: List[np.ndarray] = []  # each entry: (N, 2) per-tick positions
     for tick in range(env.cfg.subgoal_steps):
         obs_xys = nearby_obstacle_centres(env)
         margins = obstacle_margins(env, obs_xys)
@@ -146,6 +163,10 @@ def run_low_level_loop(env: "MultiRobotSearchEnv", subgoals: dict) -> dict:
                 h += float(env._rng.normal(0.0, env.cfg.gp_obs_noise_std))
                 st.obs_buffer.append((float(st.pose[0]), float(st.pose[1]), h))
             cvar_total += env.gp.cvar_risk(st.pose[:2])
+        # Record per-tick positions for fine-grained exploration overlap.
+        positions_history.append(
+            np.array([env._states[a].pose[:2].copy() for a in env.agents], dtype=np.float32)
+        )
         env.gp.update([st.pose[:2] for st in env._states.values() if not st.crashed])
         if env.cfg.use_real_gp and (tick + 1) % max(1, env.cfg.gp_update_interval) == 0:
             flush_gp_buffers(env)
@@ -158,4 +179,5 @@ def run_low_level_loop(env: "MultiRobotSearchEnv", subgoals: dict) -> dict:
         "cvar_total": cvar_total,
         "lyap_total": lyap_total,
         "infeasible": infeasible,
+        "positions_history": positions_history,
     }

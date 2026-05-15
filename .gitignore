@@ -4,7 +4,9 @@
 reference_code/
 __pycache__/
 .pytest_cache/
-
+.qwen/
+.roo/
+plans/
 
 # Python compiled files
 *.pyc
@@ -74,3 +76,7 @@ wheels/
 *.temp
 .venv
 reference_code
+
+
+.roomodes
+

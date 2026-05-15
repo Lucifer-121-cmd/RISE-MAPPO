@@ -7,3 +7,10 @@ eval:
   save_videos: false          # off; enable post-training
   results_dir: "results/eval"
   seeds: [100, 200, 300, 400, 500]
+
+# Enable Phase-2 features for meaningful CVaR and Lyapunov metrics
+env:
+  use_real_gp: true           # GP learns actual hazard field → CVaR varies by risk
+  use_lyap_mpc: true          # MPC enforces Lyapunov contraction → stability metrics work
+  gp_update_interval: 10      # GP fusion every 10 low-level ticks
+  gp_obs_noise_std: 0.05      # Observation noise for hazard sensing

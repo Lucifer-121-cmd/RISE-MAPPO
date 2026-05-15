@@ -1,4 +1,0 @@
-episode,coverage_rate,detection_success,time_to_detection,collision_rate,energy_efficiency,mean_cvar_risk,exploration_overlap,lyapunov_monotonic,lyapunov_max_violation,lyapunov_mean_decay
-0,0.726,0.6,300.0,3.0,0.017645543983466738,0.05248366296291351,0.0,1.0,0.0,0.0
-1,0.908,0.6,300.0,3.0,0.020130085954263497,0.05000000819563866,0.0,1.0,0.0,0.0
-2,0.7888,0.4,300.0,3.0,0.046639116564417174,0.05351851508021355,0.0,1.0,0.0,0.0

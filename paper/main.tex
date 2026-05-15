@@ -202,19 +202,32 @@ where $\mathcal{L}_{\vmean}$ and $\mathcal{L}_{\vcvar}$ are clipped value losses
 
 Standard MAPPO critics aggregate per-agent features through concatenation or mean-pooling, treating all agents identically. In spatial exploration, an agent operating at the boundary of the known map contributes more decision-relevant information than one revisiting well-mapped terrain. We encode this asymmetry through an uncertainty-modulated attention mechanism.
 
-Let $\mathbf{h}_i \in \Rbb^d$ be the feature vector for agent~$i$ extracted from the shared backbone, and let $\sigma_i$ be the GP posterior standard deviation at robot~$i$'s position. The attention weight for agent~$i$ is:
+Let $\mathbf{h}_i \in \Rbb^d$ be the feature vector for agent~$i$ extracted from the shared backbone, and let $\sigma_i$ be the GP posterior standard deviation at robot~$i$'s position. We first embed each agent's uncertainty through a learned single-layer MLP:
 \begin{equation}
-w_i = \frac{\exp\!\big(\mathbf{q}^\top \mathbf{h}_i \cdot (1 + \eta \, \tilde{\sigma}_i)\big)}{\sum_{j=1}^{N} \exp\!\big(\mathbf{q}^\top \mathbf{h}_j \cdot (1 + \eta \, \tilde{\sigma}_j)\big)},
-\label{eq:attention}
+\mathbf{s}_i = \text{ReLU}(W_\sigma \sigma_i + b_\sigma) \in \Rbb^d,
+\label{eq:sigma_embed}
 \end{equation}
-where $\mathbf{q} \in \Rbb^d$ is a learnable query vector, $\tilde{\sigma}_i = \sigma_i / \max_j \sigma_j$ is the normalized uncertainty, and $\eta \geq 0$ is a temperature hyperparameter controlling the strength of the uncertainty modulation. When $\eta = 0$, the mechanism reduces to standard dot-product attention.
+where $W_\sigma \in \Rbb^{d \times 1}$ and $b_\sigma \in \Rbb^d$ are learnable parameters. This embedding allows the network to learn a nonlinear transformation of the raw uncertainty magnitude.
 
-The attended global feature is:
+We then compute scaled dot-product attention with uncertainty modulation in both queries and keys:
+\begin{align}
+Q_i &= W_Q(\mathbf{h}_i + \eta \, \mathbf{s}_i), \quad K_j = W_K(\mathbf{h}_j + \eta \, \mathbf{s}_j), \quad V_j = W_V(\mathbf{h}_j), \label{eq:qkv} \\
+e_{ij} &= \frac{Q_i^\top K_j}{\sqrt{d}} + \eta \, \sigma_j, \label{eq:scores} \\
+w_{ij} &= \frac{\exp(e_{ij})}{\sum_{k=1}^{N} \exp(e_{ik})}, \label{eq:weights}
+\end{align}
+where $W_Q, W_K, W_V \in \Rbb^{d \times d}$ are learnable projection matrices, $d$ is the feature dimension, and $\eta \geq 0$ is a temperature hyperparameter. The additive bias $\eta \sigma_j$ in~\eqref{eq:scores} ensures that agents in high-uncertainty regions receive more attention regardless of their learned feature content, making uncertainty a first-order signal rather than only a modulator of the learned $Q^\top K$ interaction. Modulating both queries and keys means that agents in uncertain regions both \emph{issue stronger queries} (seeking coordination) and \emph{attract more attention} from teammates.
+
+The attended feature for agent~$i$ is:
 \begin{equation}
-\mathbf{g} = \textstyle\sum_{i=1}^{N} w_i \, \mathbf{h}_i,
+\mathbf{g}_i = \textstyle\sum_{j=1}^{N} w_{ij} \, V_j,
+\label{eq:attended_per_agent}
+\end{equation}
+and the global feature fed to both the $\vmean$ and $\vcvar$ heads is the mean across agents:
+\begin{equation}
+\mathbf{g} = \frac{1}{N} \textstyle\sum_{i=1}^{N} \mathbf{g}_i.
 \label{eq:attended}
 \end{equation}
-which is then fed to both the $\vmean$ and $\vcvar$ heads. This design requires no additional communication beyond what CTDE already provides (all agent features are available to the centralized critic during training) and adds negligible computational cost since the attention is a single softmax over $N$ agents.
+When $\eta = 0$, the mechanism reduces to standard scaled dot-product attention without uncertainty modulation. This design requires no additional communication beyond what CTDE already provides (all agent features are available to the centralized critic during training) and adds negligible computational cost since the attention is a single softmax over $N$ agents per query.
 
 \subsection{Lyapunov-Stable MPC Tracking}
 \label{sec:mpc}
@@ -286,7 +299,7 @@ Algorithm~\ref{alg:rise} summarizes the online execution loop. Every $K_s$ low-l
 
 \subsection{Experimental Setup}
 
-We evaluate RISE-MAPPO in a custom multi-robot search environment implemented in Python with Gymnasium. The robots follow the TurtleBot3 Burger kinematic model~\eqref{eq:dynamics} with parameters listed in Table~\ref{tab:params}. The MPC is formulated in CasADi and solved with IPOPT. Local GPs use GPyTorch with 50 inducing points and a squared-exponential kernel.
+We evaluate RISE-MAPPO in a custom multi-robot search environment implemented in Python with Gymnasium. The robots follow the TurtleBot3 Burger kinematic model~\eqref{eq:dynamics} with parameters listed in Table~\ref{tab:params}. Energy consumption is modeled through a quadratic power model $P(v,\omega) = c_1 v^2 + c_2 \omega^2 + c_3 |v||\omega| + c_4 |v| + c_5$ with coefficients calibrated to the TurtleBot3 Burger platform (see~\cite{dhakal2025gpcvar}). This model replaces the linear heuristic $P \propto |v| + 0.1|\omega|$ used in the proportional baseline controller. Energy efficiency values are therefore controller-dependent and should only be compared within the same controller regime. The MPC is formulated in CasADi and solved with IPOPT. Local GPs use GPyTorch with 50 inducing points and a squared-exponential kernel.
 
 \begin{table}[t]
 \caption{Simulation and training parameters.}
@@ -336,10 +349,10 @@ We compare against:
 \end{itemize}
 
 \subsubsection{Evaluation Metrics}
-\textcolor{red}{[Coverage rate, detection success rate, collision rate, energy efficiency, mean CVaR risk, exploration overlap, Lyapunov stability (monotonic fraction). 50 episodes per scenario, 5 seeds. Statistical testing: Wilcoxon signed-rank with Cliff's delta effect size.]}
+\textbf{Coverage rate:} fraction of explorable area covered. \textbf{Detection success rate:} fraction of targets found. \textbf{Collision rate:} total collision events per episode. \textbf{Energy efficiency:} coverage achieved per unit energy consumed (higher is better). Note that energy efficiency values are controller-dependent: the Lyapunov-MPC uses a quadratic power model while baselines use a linear heuristic, so absolute values are not directly comparable across controller types. \textbf{Mean CVaR risk:} average per-robot per-step CVaR of the GP hazard posterior. \textbf{Exploration overlap:} fraction of visited cells touched by more than one robot. \textbf{Lyapunov stability:} fraction of steps with monotonic decrease in the Lyapunov function. 50 episodes per scenario, 5 seeds. Statistical testing: Wilcoxon signed-rank with Cliff's delta effect size.
 
 \subsection{Main Results}
-\textcolor{red}{[Table~III: main comparison across all baselines on Complex scenario. Coverage curves (Fig.~X). Discussion of risk--return trade-off.]}
+\textcolor{red}{[Table~III: main comparison across all baselines on Complex scenario. Coverage curves (Fig.~X). Discussion of risk--return trade-off. Energy efficiency comparisons between RISE-MAPPO (Lyapunov-MPC) and baselines (proportional controller) should be interpreted with caution due to different underlying energy models (see Section~IV-A).]}
 
 \subsection{Ablation Study}
 \textcolor{red}{[Table~IV: ablation results. Each component's individual contribution. Bar chart (Fig.~X).]}
@@ -359,7 +372,7 @@ We presented RISE-MAPPO, a hierarchical framework for risk-sensitive multi-robot
 
 \textcolor{red}{[RESULTS SUMMARY: quantitative improvements over baselines. Ablation confirms each component's contribution.]}
 
-\textbf{Limitations.} The current evaluation uses a 2D simulated environment with idealized sensing. The GP kernel hyperparameters are fixed rather than adapted online, which may limit performance in highly heterogeneous environments. The Lyapunov contraction constraint can become infeasible near obstacle boundaries, requiring a fallback to softer constraints.
+\textbf{Limitations.} The current evaluation uses a 2D simulated environment with idealized sensing. The energy model differs between the Lyapunov-MPC and the proportional baseline controller, making direct energy efficiency comparisons controller-dependent. The GP kernel hyperparameters are fixed rather than adapted online, which may limit performance in highly heterogeneous environments. The Lyapunov contraction constraint can become infeasible near obstacle boundaries, requiring a fallback to softer constraints.
 
 \textbf{Future work.} Deployment on physical TurtleBot3 robots via ROS\,2 is planned. Extending the CVaR formulation to risk-sensitive communication scheduling, where agents decide not only where to explore but also when to share GP data based on the marginal value of information, is a promising direction.
 

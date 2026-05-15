@@ -1,15 +1,23 @@
 # Evaluation Guide
 
+> **Important:** For production (paper-quality) evaluations, do **not** pass
+> `--num-episodes` on the CLI.  The default of 50 episodes (from
+> `configs/eval_default.yaml`) provides statistically meaningful results.
+> The 3–5 episode runs in `results/eval/` were smoke tests only.
+
+
 ## Running Evaluations
 
 ### Trained policy
 ```bash
+# Production evaluation (50 episodes, Phase-2 features enabled via eval config)
 python scripts/evaluate.py \
     --policy trained \
     --checkpoint results/runs/full_seed42/checkpoints/mappo_upd1000.pt \
     --config configs/default.yaml \
     --scenario configs/scenario_complex.yaml \
     --eval-config configs/eval_default.yaml
+# Do NOT pass --num-episodes for production runs; the default of 50 is correct.
 ```
 
 ### Baseline

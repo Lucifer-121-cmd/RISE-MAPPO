@@ -63,8 +63,16 @@ def _build_env_cfg(merged: dict, seed: int) -> EnvConfig:
     for rk, rv in rew.items():
         key = rk if rk.startswith("w_") else f"w_{rk}"
         raw[key] = rv
+    # Pull top-level 'mpc' section into the env config so _make_controller()
+    # receives the configured MPC parameters rather than LyapunovMPCConfig
+    # dataclass defaults.  The 'mpc' key lives outside 'env' in the YAML.
+    if "mpc" in merged:
+        raw["mpc"] = merged["mpc"]
     # Drop keys not in EnvConfig (e.g. scenario-only fields).
     safe = {k: v for k, v in raw.items() if k in _VALID_ENV_FIELDS}
+    dropped = set(raw.keys()) - set(safe.keys())
+    if dropped:
+        _LOG.debug("_build_env_cfg dropped keys not in EnvConfig: %s", sorted(dropped))
     return EnvConfig(seed=seed, **safe)
 
 
@@ -125,6 +133,27 @@ def _per_robot_crashed(env: MultiRobotSearchEnv) -> np.ndarray:
     return np.array([1.0 if env._states[a].crashed else 0.0 for a in env.agents], dtype=np.float32)
 
 
+def _per_robot_lyapunov(env: MultiRobotSearchEnv, ep: EpisodeData = None) -> np.ndarray:
+    """Compute Lyapunov V(x) = 0.5 * ||pose - reference||² for each robot.
+
+    When ``ep.lyapunov_reference`` is set (baselines that change subgoals every
+    MARL step), the reference is a fixed spawn position so the metric measures
+    convergence toward a stationary point.  Otherwise the reference is the
+    robot's current committed subgoal (RISE-MAPPO / trained policies).
+    """
+    out = np.zeros(env.cfg.num_robots, dtype=np.float32)
+    for i, a in enumerate(env.agents):
+        pose = env._states[a].pose[:2]
+        if ep is not None and ep.lyapunov_reference is not None:
+            ref = ep.lyapunov_reference[i]
+        else:
+            ref = env._states[a].last_subgoal
+        dx = pose[0] - ref[0]
+        dy = pose[1] - ref[1]
+        out[i] = 0.5 * (dx * dx + dy * dy)
+    return out
+
+
 def run_episode(policy: BasePolicy, env: MultiRobotSearchEnv, seed: int) -> EpisodeData:
     """One eval episode. Returns the populated :class:`EpisodeData`."""
     obs, _info = env.reset(seed=seed)
@@ -135,6 +164,12 @@ def run_episode(policy: BasePolicy, env: MultiRobotSearchEnv, seed: int) -> Epis
         max_steps=env.cfg.max_steps,
         world_size=float(env.cfg.world_size),
     )
+    # For baselines that change subgoals every MARL step (Nearest Frontier,
+    # Random, Voronoi), set a fixed Lyapunov reference at the spawn position
+    # so the metric measures convergence toward a stationary point rather than
+    # a moving target (which would trivially yield monotonic_fraction = 1.0).
+    if not isinstance(policy, (TrainedPolicy, AblationPolicy)):
+        ep.lyapunov_reference = _per_robot_pose(env)[:, :2].copy()
     energy_init = _per_robot_energy(env)
     detected_prev = 0
     crashed_prev = _per_robot_crashed(env)
@@ -150,8 +185,7 @@ def run_episode(policy: BasePolicy, env: MultiRobotSearchEnv, seed: int) -> Epis
         ep.coverage_maps.append(env._coverage_mask.copy())
         ep.gp_uncertainty.append(env.gp.uncertainty_grid().copy())
         ep.cvar_values.append(_per_robot_cvar(env))
-        lyap_scalar = float(info.get("lyapunov_mean", 0.0))
-        ep.lyapunov_values.append(np.full(env.cfg.num_robots, lyap_scalar, dtype=np.float32))
+        ep.lyapunov_values.append(_per_robot_lyapunov(env, ep))
         cur_energy = _per_robot_energy(env)
         ep.energy_consumed.append((energy_init - cur_energy).astype(np.float32))
         crashed_now = _per_robot_crashed(env)
@@ -161,6 +195,10 @@ def run_episode(policy: BasePolicy, env: MultiRobotSearchEnv, seed: int) -> Epis
         ep.detections.append(max(0, detected_now - detected_prev))
         detected_prev = detected_now
         ep.rewards.append(float(next(iter(rew_dict.values()))))
+        # Fine-grained per-tick positions for exploration overlap (Fix 4).
+        positions_tick = info.get("positions_history", None)
+        if positions_tick is not None:
+            ep.positions_per_tick.extend(positions_tick)
         # MPC solve times: not surfaced by the env yet → zeros placeholder.
         ep.mpc_solve_times.append(np.zeros(env.cfg.num_robots, dtype=np.float32))
     ep.total_targets_found = detected_prev
@@ -223,16 +261,17 @@ def save_results(
         for i, ep in enumerate(episodes):
             metrics = compute_all_metrics(ep)
             w.writerow([i, *[metrics[k] for k in METRIC_KEYS]])
-    # Coverage curves (N_eps, T_max) padded with last value.
+    # Coverage curves (N_eps, T_max).  Episodes that terminate early (crashes,
+    # energy depletion, early detection) are padded with NaN rather than the
+    # last coverage value to avoid inflating aggregate statistics.  Downstream
+    # plotting and analysis must use nan-aware aggregation (np.nanmean, etc.).
     curves = [coverage_over_time(ep) for ep in episodes]
     T_max = max((len(c) for c in curves), default=0)
-    arr = np.zeros((len(curves), T_max), dtype=np.float32)
+    arr = np.full((len(curves), T_max), np.nan, dtype=np.float32)
     for i, c in enumerate(curves):
         if len(c) == 0:
             continue
         arr[i, : len(c)] = c
-        if len(c) < T_max:
-            arr[i, len(c):] = c[-1]
     np.save(out_dir / "coverage_curves.npy", arr)
     # Raw episode dumps for replotting.
     if save_trajectories:
@@ -250,6 +289,12 @@ def save_results(
                 collisions=np.stack(ep.collisions, axis=0) if ep.collisions else np.zeros(0),
                 detections=np.array(ep.detections, dtype=np.int32),
                 rewards=np.array(ep.rewards, dtype=np.float32),
+                # Fine-grained per-tick positions for trajectory plotting and
+                # exploration overlap verification (Fix 4).
+                positions_per_tick=(
+                    np.stack(ep.positions_per_tick, axis=0)
+                    if ep.positions_per_tick else np.zeros(0)
+                ),
                 num_robots=ep.num_robots,
                 num_targets=ep.num_targets,
                 max_steps=ep.max_steps,
@@ -285,6 +330,14 @@ def main(argv: List[str] = None) -> Tuple[Path, Dict[str, Dict[str, float]]]:
     if args.num_episodes is not None:
         eval_cfg["num_episodes"] = int(args.num_episodes)
     merged = _merge(base_cfg, scenario_cfg)
+    # Merge eval-level env overrides (Phase-2 toggles: use_real_gp, use_lyap_mpc,
+    # gp_update_interval, gp_obs_noise_std, etc.).  Without this step the eval
+    # config's ``env`` section is silently discarded and all evaluations run with
+    # the proportional controller + Phase-1 decay GP, producing meaningless CVaR
+    # and Lyapunov metrics.
+    eval_env_overrides = _load_yaml(args.eval_config).get("env", {})
+    if eval_env_overrides:
+        merged = _merge(merged, {"env": eval_env_overrides})
     env_cfg = _build_env_cfg(merged, seed=int(eval_cfg.get("seeds", [0])[0]))
     env = MultiRobotSearchEnv(env_cfg)
     policy = build_policy(

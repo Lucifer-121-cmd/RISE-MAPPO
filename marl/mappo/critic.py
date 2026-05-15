@@ -38,9 +38,8 @@ class CriticConfig:
     use_popart: bool = True
     # RISE-MAPPO settings (Phase 2.5).
     use_rise: bool = False
-    gp_attention_eta: float = 1.0
+    gp_attention_eta: float = 0.5  # FIXED: was 1.0, now matches default.yaml
     world_size: float = 10.0
-
 
 def _build_global_cnn(in_channels: int, channels: Tuple[int, int, int]) -> nn.Sequential:
     c1, c2, c3 = channels

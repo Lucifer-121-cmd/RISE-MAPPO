@@ -159,8 +159,11 @@ def plot_coverage_curves(
             continue
         T = arr.shape[1]
         t = np.arange(T)
-        mu = arr.mean(axis=0)
-        sd = arr.std(axis=0)
+        # Use nan-safe aggregation because coverage curves are NaN-padded
+        # for episodes that terminate early (crashes, energy depletion,
+        # all-targets-found).  np.mean / np.std would propagate NaN.
+        mu = np.nanmean(arr, axis=0)
+        sd = np.nanstd(arr, axis=0)
         c = _color_for(pol, i)
         ax.plot(t, mu, color=c, label=pol, linewidth=1.2)
         ax.fill_between(t, mu - sd, mu + sd, color=c, alpha=0.2, linewidth=0)

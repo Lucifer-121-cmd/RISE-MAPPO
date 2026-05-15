@@ -17,6 +17,16 @@ env:
   energy_budget: 100.0
   add_noise: false
   use_dynamic_step: false
+  # Phase-2 features — required for RISE-MAPPO CVaR head and GP-attention.
+  # When false, the CVaR critic head learns on a synthetic decay grid rather
+  # than real GP posterior uncertainty, making the core contribution (C1)
+  # untestable.
+  use_real_gp: true
+  use_lyap_mpc: true
+  gp_update_interval: 10
+  gp_obs_noise_std: 0.05
+  cvar_alpha: 0.95
+  obstacle_margin_scale: 0.2
 
 # Robot (TurtleBot3 Burger) — see configs/turtlebot3.yaml for fixed specs.
 robot:
@@ -56,13 +66,24 @@ reward:
   w_coordination: 0.2
   w_collision: 10.0
 
-# Lyapunov-MPC (Phase 2 — placeholder values)
+# Lyapunov-MPC (Phase 2).  All values are read by make_controller() in
+# envs/integrations.py and passed to LyapunovMPCConfig.  No hardcoded defaults
+# in the controller construction — every parameter is configurable here.
 mpc:
   horizon: 20
   dt: 0.1
   Q_diag: [10.0, 10.0, 1.0]
   R_diag: [1.0, 0.5]
+  S_du_diag: [1.0, 0.5]
   alpha_lyap: 0.1
+  d_safe: 0.5
+  soft_lyap_penalty: 1000.0
+  max_iter: 100
+  max_cpu_time: 1.0
+  max_obstacles: 8
+  goal_tolerance: 0.1
+  P_terminal_scale: 5.0
+  w_energy: 0.1
 
 # Distributed GP (Phase 2 — placeholder values)
 gp:

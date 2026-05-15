@@ -8,5 +8,5 @@ env:
   max_steps: 300
   num_targets: 5
   num_obstacles: 3
-  num_hazards: 0
+  num_hazards: 3   # must be >0 for CVaR metrics to be meaningful
   difficulty: "easy"

@@ -67,6 +67,9 @@ class EnvConfig:
     gp_obs_noise_std: float = 0.05
     cvar_alpha: float = 0.95
     obstacle_margin_scale: float = 0.2
+    # MPC parameters — passed through to LyapunovMPCConfig via make_controller().
+    # When empty, the controller uses its own dataclass defaults.
+    mpc: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -267,6 +270,8 @@ class MultiRobotSearchEnv:
             # ~subgoal_steps×num_robots larger than reward magnitude.
             "risk_cost": float(normalised_cvar),
             "agent_sigmas": self._per_agent_sigmas(),
+            # Fine-grained per-tick positions for exploration overlap metric.
+            "positions_history": loop_stats.get("positions_history", []),
         }
         return self._build_observations(), rewards, terminations, truncations, infos
 
@@ -295,9 +300,14 @@ class MultiRobotSearchEnv:
         return None
 
     def _make_controller(self):
-        """Return per-robot controller (Phase-2 NLP if configured, else P)."""
+        """Return per-robot controller (Phase-2 NLP if configured, else P).
+
+        Passes the ``mpc`` config section (if present) so every MPC parameter
+        is YAML-configurable with no hardcoded values in the construction path.
+        """
         from envs.integrations import make_controller
-        return make_controller(self)
+        mpc_cfg = getattr(self.cfg, "mpc", None) or {}
+        return make_controller(self, mpc_cfg)
 
     def _sample_free_position(
         self,
