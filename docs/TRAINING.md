@@ -12,8 +12,56 @@ python scripts/train.py --config configs/default.yaml --seed 42 --device cuda
 - `--device` — `cuda`, `cpu`, or `cuda:0` / `cuda:1` for specific GPU
 - `--updates` — override number of training updates
 - `--smoke` — quick test (2 updates, 1 env, minimal rollout)
+- `--resume` — path to checkpoint for resuming training
+- `--diag` — enable critic diagnostic prints (debugging)
+- `--log-level` — logging level (default: INFO)
 
 **Output:** Training logs to stdout (redirect with `tee`). Checkpoints saved every 50 updates to `training.save_dir` (default: `results/checkpoints/`).
+
+### Phase-2 Training (Real GP + Lyapunov-MPC)
+
+Phase-2 training enables real GP posterior data and Lyapunov-MPC obstacle avoidance. This is ~4–5× slower per update (~17 min vs ~4 min for Phase-1) due to IPOPT solves at every low-level tick.
+
+```bash
+# Full Phase-2 training (500 updates, ~6 days on single GPU)
+python scripts/train.py \
+    --config configs/default.yaml \
+    --seed 42 \
+    --device cuda \
+    --updates 500 2>&1 | tee train_phase2_seed42.log
+
+# Use specific GPU (e.g., GPU 1 when GPU 0 is busy)
+CUDA_VISIBLE_DEVICES=1 python scripts/train.py \
+    --config configs/default.yaml \
+    --seed 42 \
+    --device cuda \
+    --updates 500 2>&1 | tee train_phase2_seed42.log
+```
+
+The updated `configs/default.yaml` already has `use_real_gp: true` and `use_lyap_mpc: true`. No additional flags needed.
+
+**Resuming from a checkpoint:**
+```bash
+python scripts/train.py \
+    --config configs/default.yaml \
+    --seed 42 \
+    --device cuda \
+    --resume results/phase1_seed42/mappo_upd500.pt
+```
+
+**Parallel execution (eval + training simultaneously):**
+```bash
+# Terminal 1: Evaluation (CPU-only)
+export OMP_NUM_THREADS=8
+python scripts/evaluate.py --policy random --scenario configs/scenario_simple.yaml \
+    --eval-config configs/eval_default.yaml 2>&1 | tee eval.log
+
+# Terminal 2: Training (GPU 1)
+export CUDA_VISIBLE_DEVICES=1
+export OMP_NUM_THREADS=8
+python scripts/train.py --config configs/default.yaml --seed 42 \
+    --device cuda --updates 500 2>&1 | tee train.log
+```
 
 ## Multi-Seed Batch Training
 
@@ -63,22 +111,25 @@ python scripts/collect_results.py
 
 ## Output Directory Structure
 
-Each run is isolated under `results/runs/`:
+```
+results/
+├── phase1_seed42/                # Phase-1 trained checkpoints (1000 updates)
+│   ├── mappo_upd50.pt
+│   ├── mappo_upd100.pt
+│   └── ... (every 50 updates through upd1000)
+├── checkpoints/                  # Phase-2 training checkpoints (created at runtime)
+│   └── mappo_upd{50,100,...}.pt
+├── eval/                         # Evaluation outputs (per scenario / per policy)
+│   └── {scenario}/
+│       └── {policy_name}/
+│           ├── metrics_summary.json
+│           ├── metrics_per_episode.csv
+│           ├── coverage_curves.npy
+│           └── episode_data/
+└── runs/                         # (reserved for future multi-seed batch runs)
+```
 
-```
-results/runs/
-├── full_seed42/
-│   ├── run_config.yaml       # Config used (with overrides)
-│   ├── config_used.yaml      # Original config copy
-│   ├── train.log             # Full training log
-│   ├── checkpoints/          # Isolated checkpoints
-│   │   ├── mappo_upd50.pt
-│   │   ├── mappo_upd100.pt
-│   │   └── ...
-│   └── DONE                  # Completion marker
-├── no_rise_seed42/
-└── ...
-```
+**Note:** Phase-1 checkpoints were renamed from `results/checkpoints/` to `results/phase1_seed42/` to avoid overwriting by the Phase-2 training run. The Phase-2 run creates a fresh `results/checkpoints/` directory.
 
 ## Log Format
 
@@ -107,8 +158,18 @@ Evaluation with deterministic actions usually shows higher coverage than trainin
 
 ## Known Issues and Fixes
 
+### Training Stability
 1. **Risk cost scale mismatch**: Raw CVaR can be 75× reward scale → always normalize to [0,1]
 2. **Gradient explosion with dual-head**: `max_grad_norm` must be 0.5 (not default 10)
 3. **NaN in critic outputs**: `nan_to_num` guards + skip-on-nonfinite-grad
 4. **Dead critic (vl=0.000)**: PopArt/nan guard interaction → separate PopArt per head
+
+### Resource Constraints
 5. **GPU memory**: Each run needs ~4-5 GB. Two runs fit on 2× RTX 2080 Ti (11GB each)
+6. **Phase-2 training speed**: ~17 min/update (vs ~4 min for Phase-1). 500 updates ≈ 6 days.
+7. **Scalability runtime**: 8-robot scenario runs ~100,000 IPOPT solves per episode (~83 min/ep). Use `--num-episodes 10` for robot counts ≥ 6.
+
+### Evaluation Caveats
+8. **Checkpoint distribution mismatch**: Phase-1 checkpoints were trained with synthetic GP decay grid. Evaluating with Phase-2 enabled is out-of-distribution.
+9. **Energy efficiency comparability**: Lyapunov-MPC quadratic power model vs proportional linear heuristic produce values on different scales (~10×). Cross-controller comparisons are not meaningful.
+10. **IPOPT infeasibility**: Lyapunov contraction constraint can become infeasible near obstacles. Soft slack penalty ensures NLP feasibility but may degrade tracking.

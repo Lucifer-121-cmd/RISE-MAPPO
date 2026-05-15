@@ -13,7 +13,7 @@
 # Production evaluation (50 episodes, Phase-2 features enabled via eval config)
 python scripts/evaluate.py \
     --policy trained \
-    --checkpoint results/runs/full_seed42/checkpoints/mappo_upd1000.pt \
+    --checkpoint results/phase1_seed42/mappo_upd1000.pt \
     --config configs/default.yaml \
     --scenario configs/scenario_complex.yaml \
     --eval-config configs/eval_default.yaml
@@ -30,24 +30,62 @@ python scripts/evaluate.py \
 
 ### Ablation
 ```bash
+# CVaR head ablation (λ_risk=0, β=0)
 python scripts/evaluate.py \
     --policy trained \
-    --checkpoint results/runs/no_rise_seed42/checkpoints/mappo_upd1000.pt \
-    --config configs/ablation_no_rise.yaml \
+    --checkpoint results/phase1_seed42/mappo_upd1000.pt \
+    --config configs/ablation_no_cvar_head.yaml \
     --scenario configs/scenario_complex.yaml \
     --eval-config configs/eval_default.yaml \
     --name "Ours-no-CVaR"
+
+# GP attention ablation (η=0)
+python scripts/evaluate.py \
+    --policy trained \
+    --checkpoint results/phase1_seed42/mappo_upd1000.pt \
+    --config configs/ablation_no_attention.yaml \
+    --scenario configs/scenario_complex.yaml \
+    --eval-config configs/eval_default.yaml \
+    --name "Ours-no-GP-Attn"
+
+# Full RISE removal (standard MAPPO)
+python scripts/evaluate.py \
+    --policy trained \
+    --checkpoint results/phase1_seed42/mappo_upd1000.pt \
+    --config configs/ablation_no_rise.yaml \
+    --scenario configs/scenario_complex.yaml \
+    --eval-config configs/eval_default.yaml \
+    --name "MAPPO-only"
 ```
+
+### Phase-2 Features (Real GP + Lyapunov-MPC)
+
+The evaluation config (`configs/eval_default.yaml`) controls whether real GP posterior data or synthetic Phase-1 decay grid data is used. The `env` section is merged into the environment config during evaluation:
+
+```yaml
+# eval_default.yaml
+eval:
+  num_episodes: 50
+  deterministic: true
+  device: "cpu"
+env:
+  use_real_gp: true      # Set to false for Phase-1 synthetic decay grid
+  use_lyap_mpc: true     # Set to false for proportional controller
+  gp_update_interval: 10
+  gp_obs_noise_std: 0.05
+```
+
+**Important:** Phase-1 checkpoints (`results/phase1_seed42/`) were trained with `use_real_gp=False` and `use_lyap_mpc=False`. Evaluating them with Phase-2 enabled is an out-of-distribution test. For the strongest results, use Phase-2 trained checkpoints from `results/checkpoints/`.
 
 ## Scenarios
 
-| Scenario | Config | Robots | Targets | Key Feature |
-|----------|--------|--------|---------|-------------|
-| Simple | `scenario_simple.yaml` | 3 | 5 | Open environment, minimal obstacles |
-| Complex | `scenario_complex.yaml` | 5 | 10 | Corridors, hazard zones (main eval) |
-| Scalability | `scenario_scalability.yaml` | 3-8 | 10 | Vary robot count |
-| Energy | `scenario_energy.yaml` | 5 | 10 | Half energy budget |
-| Comms Failure | `scenario_comms.yaml` | 5 | 10 | 50% GP fusion drop rate |
+| Scenario | Config | Robots | Targets | Hazards | World | Key Feature |
+|----------|--------|--------|---------|---------|-------|-------------|
+| Simple | `scenario_simple.yaml` | 3 | 5 | 3 | 5×5 m | Open environment, fast baseline |
+| Complex | `scenario_complex.yaml` | 5 | 10 | 3 | 10×10 m | Corridors, hazard zones (main eval) |
+| Scalability | `scenario_scalability.yaml` | 3–8 | 10 | 2 | 10×10 m | Vary robot count |
+| Energy | `scenario_energy.yaml` | 5 | 10 | 2 | 10×10 m | Half energy budget (50.0) |
+| Comms Failure | `scenario_comms.yaml` | 5 | 10 | 2 | 10×10 m | 50% GP fusion drop rate |
 
 ## Metrics
 
@@ -59,10 +97,17 @@ All metrics computed in `analysis/metrics.py`:
 | Detection Success | `detection_success_rate()` | Fraction of targets found |
 | Time to Detection | `time_to_full_detection()` | Steps until all targets found |
 | Collision Rate | `collision_rate()` | Total collisions per episode |
-| Energy Efficiency | `energy_efficiency()` | Coverage / total energy |
+| Energy Efficiency | `energy_efficiency()` | Coverage / total energy (controller-dependent; see note below) |
 | Mean CVaR Risk | `mean_cvar_risk()` | Average tail risk encountered |
 | Exploration Overlap | `exploration_overlap()` | Cells visited by >1 robot |
 | Lyapunov Stability | `lyapunov_stability()` | Monotonic decrease fraction |
+
+**Important metric notes:**
+
+- **Energy efficiency** is controller-dependent. The Lyapunov-MPC uses a quadratic power model while baselines use a linear heuristic. Absolute values are not directly comparable across controller types.
+- **Exploration overlap** uses fine-grained per-tick robot positions (recorded at every low-level controller tick) for accurate computation.
+- **Lyapunov stability** for baselines uses a fixed spawn-position reference rather than the per-step subgoal, preventing degenerate `monotonic_fraction = 1.0` values.
+- **Coverage curves** are NaN-padded for episodes that terminate early (crashes, energy depletion, all targets found). Downstream plotting uses nan-aware aggregation (`np.nanmean`, `np.nanstd`).
 
 ## Output Structure
 
@@ -74,7 +119,8 @@ results/eval/{scenario}/{policy_name}/
 ├── episode_data/              # full episode data for plotting
 │   ├── ep_000.npz
 │   └── ...
-└── eval_config.yaml           # config used (reproducibility)
+├── scenario.yaml               # scenario config used
+└── eval.yaml                   # eval config used (reproducibility)
 ```
 
 ## Baselines

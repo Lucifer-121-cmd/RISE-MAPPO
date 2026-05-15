@@ -34,7 +34,7 @@ The GP-uncertainty attention is novel: instead of treating all agents equally in
 
 **What:** CasADi/IPOPT-based nonlinear MPC with Lyapunov contraction constraint `V(x_{k+1}) ≤ (1 − α_L) V(x_k)`.
 
-**Why it matters:** Provides provable monotonic convergence to subgoals — a formal safety certificate that end-to-end MARL cannot provide. GP-CVaR-based safety margins tighten constraints in uncertain regions.
+**Why it matters:** Provides provable monotonic convergence to subgoals — a formal safety certificate that end-to-end MARL cannot provide. GP-CVaR-based safety margins tighten constraints in uncertain regions. The MPC also incorporates a quadratic power model `P(v,ω) = c₁v² + c₂ω² + c₃|v||ω| + c₄|v| + c₅` calibrated to the TurtleBot3 Burger platform, replacing the linear heuristic used in the proportional baseline controller.
 
 **Files:** `mpc/lyapunov_mpc.py`
 

@@ -48,20 +48,30 @@ critic.forward(global_state, gp_sigmas) -> (v_mean, v_cvar)
 ### Lyapunov-MPC (`mpc/lyapunov_mpc.py`)
 
 ```python
-mpc.solve(current_state, subgoal, obstacles) -> ControlFeedback
-# current_state: (3,) — [x, y, θ]
-# subgoal: (2,) — [x_g, y_g]
-# Returns: ControlFeedback(v, omega, solve_time, lyapunov_value)
+mpc.compute_control(state, goal, obstacles, obstacle_margins) -> ControllerFeedback
+# state: (3,) — [x, y, θ]
+# goal: (2,) — [x_g, y_g]
+# obstacles: (2, M) or None — obstacle centres
+# obstacle_margins: (M,) or None — CVaR-augmented safety margins
+# Returns: ControllerFeedback(v, omega, energy_consumed, lyapunov_value, feasible)
 ```
 
 ### Distributed GP (`gp/distributed_gp.py`)
 
 ```python
-gp.update(robot_id, position, observation)
-gp.predict(query_points) -> (mu, sigma)
-gp.fuse_bcm(all_local_predictions) -> (mu_bcm, sigma_bcm)
-gp.compute_cvar(positions, alpha=0.05) -> cvar_values
-gp.information_gain(positions) -> info_gain
+# Phase-1 legacy interface (synthetic decay grid)
+gp.update(robot_positions) -> None
+gp.uncertainty_grid() -> sigma_grid
+gp.uncertainty_patch(robot_pos, patch_size) -> sigma_patch
+gp.information_gain() -> float
+gp.cvar_risk(robot_pos) -> float
+
+# Phase-2 BCM fusion interface (real GP posterior)
+gp.update_robot(robot_id, positions, values) -> None
+gp.fuse() -> None
+gp.predict_global(x_query) -> (mu, sigma)
+gp.cvar_risk_at(positions, alpha) -> cvar_array
+gp.information_gain_at(positions) -> info_gain_array
 ```
 
 ## Data Flow
@@ -96,7 +106,22 @@ reward = (w1 * delta_coverage      # exploration progress
 
 ## Config System
 
-All hyperparameters in `configs/default.yaml`. Ablation configs override specific fields:
+Hyperparameters are distributed across multiple YAML files and merged at runtime:
+
+| File | Scope |
+|------|-------|
+| `configs/default.yaml` | Training: env, reward, mappo, mpc, gp, training |
+| `configs/eval_default.yaml` | Evaluation: episodes, seeds, Phase-2 env toggles |
+| `configs/scenario_*.yaml` | Per-scenario overrides (robots, targets, hazards, world size) |
+| `configs/ablation_*.yaml` | Ablation overrides (disable specific RISE components) |
+
+**Merge order (evaluation):** `default.yaml` → `scenario_*.yaml` → `eval_default.yaml` (env section)
+
+**Merge order (training):** `default.yaml` only (CLI flags override specific fields)
+
+The `mpc` section lives at the top level of `default.yaml` (outside `env`) and is propagated to `EnvConfig.mpc` → `make_controller()` → `LyapunovMPCConfig`. All 14 MPC parameters are YAML-configurable with no hardcoded values.
+
+Ablation configs override specific fields:
 
 | Config | What changes |
 |--------|-------------|
@@ -111,3 +136,20 @@ All hyperparameters in `configs/default.yaml`. Ablation configs override specifi
 3. **PopArt**: Each critic head has its own PopArt normalizer to handle different output scales.
 4. **NaN guards**: `nan_to_num` on critic outputs + skip-on-nonfinite-grad in optimizer.
 5. **MPC warm-start**: Previous solution shifted by one timestep, critical for solve time.
+
+## Recent Changes (2026-05-14)
+
+### Energy Model
+The Lyapunov-MPC uses a quadratic power model `P(v,ω) = c₁v² + c₂ω² + c₃|v||ω| + c₄|v| + c₅` (see `mpc/lyapunov_mpc.py:147`), replacing the linear heuristic `abs(v) + 0.1*abs(ω)` in the proportional controller (`mpc/utils.py:104`). Energy efficiency values differ by ~10× between controller types.
+
+### Exploration Overlap
+`exploration_overlap()` now uses fine-grained per-tick positions (`EpisodeData.positions_per_tick`) recorded at every low-level controller tick, rather than coarse MARL-step positions. See `envs/integrations.py:100` and `analysis/metrics.py:102`.
+
+### Lyapunov Reference
+For baseline policies that change subgoals every MARL step, the Lyapunov metric uses a fixed spawn-position reference (`EpisodeData.lyapunov_reference`) rather than the per-step subgoal. See `scripts/evaluate.py:128` and `analysis/metrics.py:127`.
+
+### Coverage Curve Padding
+Coverage curves for early-terminated episodes are NaN-padded instead of right-padded with the last value. Plotting uses `np.nanmean`/`np.nanstd`. See `scripts/evaluate.py:262` and `analysis/plotting.py:162`.
+
+### MPC Config Propagation
+The `mpc` YAML section is now correctly propagated through `EnvConfig.mpc` → `make_controller()` → `LyapunovMPCConfig`. Previously it was silently ignored. See `scripts/train.py:70` and `scripts/evaluate.py:69`.
