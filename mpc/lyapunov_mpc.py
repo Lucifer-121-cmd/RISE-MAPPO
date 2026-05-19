@@ -21,6 +21,16 @@ with state, goal, obstacles and obstacle margins as **CasADi
 parameters**; per-step calls only update parameters and warm-start
 vectors. The number of obstacle slots is fixed at config time
 (``max_obstacles``); unused slots are filled with a far placeholder.
+
+Patches applied
+---------------
+#1  ubx slack clamp            — slack variable bounded to slack_max (default 10.0)
+#2  Infeasible → ERROR + early return — Infeasible_Problem_Detected logs ERROR
+                                        and falls back before caching warm-start
+#3  Rename _fallback_count     — renamed to _slack_activation_count (semantically correct)
+#4  Invalidate warm-start      — warm-start cleared on non-optimal solves
+#5  alpha_lyap as NLP param    — contraction rate injectable at solve time
+#6  Slack severity levels      — extreme slack → ERROR, normal slack → INFO
 """
 from __future__ import annotations
 
@@ -38,6 +48,12 @@ from mpc.utils import ControllerFeedback, proportional_subgoal_controller
 _LOG = logging.getLogger("paper3.mpc.lyapunov")
 _FAR_OBSTACLE = 1e6
 
+# IPOPT return-status sets used in severity classification (PATCH #6).
+_STATUS_OPTIMAL   = frozenset({"Solve_Succeeded", "Solved_To_Acceptable_Level"})
+_STATUS_ITER_FAIL = frozenset({"Maximum_Iterations_Exceeded"})
+_STATUS_INFEASIBLE = frozenset({"Infeasible_Problem_Detected",
+                                 "Infeasible_Problem_Detected_LS"})
+
 
 @dataclass
 class LyapunovMPCConfig:
@@ -53,7 +69,18 @@ class LyapunovMPCConfig:
     d_safe: float = 0.3
     w_energy: float = 0.1
     soft_lyap_penalty: float = 1000.0
+    # PATCH #1: upper bound on slack variable (physically: max tolerable
+    # Lyapunov contraction violation per step; 10.0 >> V_max ≈ 2.25 for
+    # 1.5 m tracking error, so values above this are unphysical noise).
+    slack_max: float = 10.0
     max_iter: int = 100
+
+    def __post_init__(self) -> None:
+        if self.slack_max <= 0.0:
+            raise ValueError(
+                f"slack_max must be > 0 (soft constraint needs positive "
+                f"upper bound; got {self.slack_max})"
+            )
     max_cpu_time: float = 1.0
     max_obstacles: int = 8
     goal_tolerance: float = 0.1
@@ -94,7 +121,9 @@ class LyapunovMPC:
             max_omega=self.config.max_omega,
             goal_tolerance=self.config.goal_tolerance,
         )
-        self._fallback_count = 0
+        # PATCH #3: renamed from _fallback_count — this counter tracks soft
+        # Lyapunov slack activations only, NOT actual P-controller fallbacks.
+        self._slack_activation_count = 0
         self._prev_X: Optional[np.ndarray] = None
         self._prev_U: Optional[np.ndarray] = None
         self._prev_S: Optional[np.ndarray] = None
@@ -125,6 +154,9 @@ class LyapunovMPC:
         p_goal = ca.MX.sym("goal", 2)
         p_obs = ca.MX.sym("obs", 2, M)
         p_margins = ca.MX.sym("mar", M)
+        # PATCH #5: alpha_lyap as a runtime NLP parameter so the contraction
+        # rate can be adjusted per-solve without rebuilding the NLP.
+        p_alpha_l = ca.MX.sym("alpha_l", 1)
         cost = ca.MX.zeros(1, 1)
         g: List[ca.MX] = []
         lbg: List[float] = []
@@ -167,10 +199,11 @@ class LyapunovMPC:
                 dist = ca.sqrt(dx * dx + dy * dy + 1e-9)
                 g.append(dist - self.config.d_safe - p_margins[j])
                 lbg.append(0.0); ubg.append(np.inf)
-            # Lyapunov contraction with slack.
+            # PATCH #5: Lyapunov contraction uses p_alpha_l (runtime param)
+            # instead of the baked-in self.config.alpha_lyap.
             V_k = self._backstepping.lyapunov_value_casadi(X[:, k], p_goal)
             V_k1 = self._backstepping.lyapunov_value_casadi(X[:, k + 1], p_goal)
-            g.append(V_k1 - (1.0 - self.config.alpha_lyap) * V_k - S[k])
+            g.append(V_k1 - (1.0 - p_alpha_l) * V_k - S[k])
             lbg.append(-np.inf); ubg.append(0.0)
             cost = cost + self.config.soft_lyap_penalty * S[k] ** 2
         # Terminal cost.
@@ -181,8 +214,10 @@ class LyapunovMPC:
                 + P_term[2] * err_T[2] ** 2)
         cost = cost + self.config.w_energy * E[N]
         # Pack decision vector and parameters.
+        # PATCH #5: p_alpha_l appended last — compute_control passes it
+        # as the final element of the numeric parameter vector.
         w = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1), S, E)
-        p = ca.vertcat(p_x0, p_goal, ca.reshape(p_obs, -1, 1), p_margins)
+        p = ca.vertcat(p_x0, p_goal, ca.reshape(p_obs, -1, 1), p_margins, p_alpha_l)
         nlp = {"x": w, "f": cost, "g": ca.vertcat(*g), "p": p}
         opts = {
             "ipopt": {
@@ -218,9 +253,13 @@ class LyapunovMPC:
             lbx[u_off + 2 * k + 1] = -self.config.max_omega
             ubx[u_off + 2 * k + 1] = self.config.max_omega
         s_off = nx + nu
-        lbx[s_off:s_off + ns] = 0.0   # slack >= 0
+        lbx[s_off:s_off + ns] = 0.0              # slack >= 0
+        # PATCH #1: hard upper bound on slack — prevents IPOPT intermediate
+        # iterates from producing unphysical slack values (observed: 10 415)
+        # when Maximum_Iterations_Exceeded is hit before convergence.
+        ubx[s_off:s_off + ns] = self.config.slack_max
         e_off = nx + nu + ns
-        lbx[e_off:e_off + ne] = 0.0   # energy >= 0
+        lbx[e_off:e_off + ne] = 0.0              # energy >= 0
         self._lbx = lbx
         self._ubx = ubx
         self._lbg = np.asarray(lbg, dtype=float)
@@ -276,6 +315,8 @@ class LyapunovMPC:
         goal: Sequence[float],
         obstacles: Optional[np.ndarray] = None,
         obstacle_margins: Optional[np.ndarray] = None,
+        # PATCH #5: alpha_lyap injectable at solve time; None → config default.
+        alpha_l: Optional[float] = None,
     ) -> ControllerFeedback:
         """Solve the Lyapunov-MPC NLP and return one control step.
 
@@ -284,6 +325,21 @@ class LyapunovMPC:
         with a non-negative slack penalty so the NLP itself remains
         feasible; ``feasible=False`` flags slack activation or solver
         failure.
+
+        Parameters
+        ----------
+        state:
+            Robot state [x, y, theta].
+        goal:
+            Subgoal position [x, y].
+        obstacles:
+            Array of obstacle centres, shape (K, 2). Optional.
+        obstacle_margins:
+            Per-obstacle safety margin additions, shape (K,). Optional.
+        alpha_l:
+            Lyapunov contraction rate override. Defaults to
+            ``config.alpha_lyap`` when None. Useful for adaptive
+            contraction (e.g. StuckDetector relaxation).
         """
         x0 = np.asarray(state, dtype=float).reshape(-1)
         if x0.shape[0] < 3:
@@ -302,8 +358,10 @@ class LyapunovMPC:
                 lyapunov_value=V_now, feasible=True,
             )
         obs_arr, mar_arr = self._format_obstacles(obstacles, obstacle_margins)
+        # PATCH #5: resolve alpha_l and append to parameter vector.
+        alpha_l_val = float(alpha_l) if alpha_l is not None else self.config.alpha_lyap
         p = np.concatenate((
-            x0, ga, obs_arr.reshape(-1, order="F"), mar_arr,
+            x0, ga, obs_arr.reshape(-1, order="F"), mar_arr, [alpha_l_val],
         ))
         w0 = self._build_warm_start(x0)
         kw = {"x0": w0, "lbx": self._lbx, "ubx": self._ubx,
@@ -327,21 +385,67 @@ class LyapunovMPC:
         w0_cmd = float(U_opt[1, 0])
         if not (np.isfinite(v0) and np.isfinite(w0_cmd)):
             return self._fallback(x0, ga, dist, V_now)
-        self._prev_X, self._prev_U, self._prev_S = X_opt, U_opt, S_opt
-        self._prev_lam_x = np.asarray(sol["lam_x"]).reshape(-1)
-        self._prev_lam_g = np.asarray(sol["lam_g"]).reshape(-1)
+
+        # PATCH #2 + #6: resolve status before caching warm-start.
+        # Infeasible → ERROR log + early return (no warm-start cache).
+        # Iter-exceeded → WARNING log (best iterate used, cache invalidated).
         status = self._solver.stats().get("return_status", "")
         slack_max = float(np.max(S_opt))
-        feasible = status in ("Solve_Succeeded", "Solved_To_Acceptable_Level")
+
+        # PATCH #2: infeasible is a hard failure — no safe trajectory exists.
+        # Return proportional fallback immediately; do NOT cache this iterate.
+        if status in _STATUS_INFEASIBLE:
+            _LOG.error(
+                "MPC INFEASIBLE slack=%.4f — falling back to P controller. status=%s",
+                slack_max, status,
+            )
+            return self._fallback(x0, ga, dist, V_now)
+
+        feasible = status in _STATUS_OPTIMAL
+
+        # PATCH #4: only cache warm-start from converged solves — a
+        # non-optimal iterate (Maximum_Iterations_Exceeded) can poison
+        # the next solve by starting from a poor-quality guess.
+        if feasible:
+            self._prev_X, self._prev_U, self._prev_S = X_opt, U_opt, S_opt
+            self._prev_lam_x = np.asarray(sol["lam_x"]).reshape(-1)
+            self._prev_lam_g = np.asarray(sol["lam_g"]).reshape(-1)
+        else:
+            # PATCH #4: invalidate — next solve starts cold rather than
+            # warm-starting from a degraded iterate.
+            self._prev_X = None
+            self._prev_U = None
+            self._prev_S = None
+            self._prev_lam_x = None
+            self._prev_lam_g = None
+
+        # PATCH #3 + #6: slack logging with correct severity levels.
+        # - Extreme slack (> slack_max, bypassed ubx clamp): ERROR
+        # - Iter-limit hit: WARNING
+        # - Normal soft-constraint activation: INFO (not WARNING — reduces
+        #   log volume ~100× for full evaluation matrix)
         if slack_max > 1e-6:
-            # Soft Lyapunov constraint relaxed by the penalty term —
-            # NLP itself stayed feasible. Log once per heavy activation.
-            self._fallback_count += 1
-            if self._fallback_count <= 5 or self._fallback_count % 50 == 0:
-                _LOG.warning(
-                    "Lyapunov soft slack=%.4f status=%s (activation #%d)",
-                    slack_max, status, self._fallback_count,
-                )
+            self._slack_activation_count += 1
+            if (self._slack_activation_count <= 5
+                    or self._slack_activation_count % 50 == 0):
+                if slack_max > self.config.slack_max * 1.01:
+                    # Should not occur after PATCH #1 — signals upstream bug.
+                    _LOG.error(
+                        "MPC EXTREME SLACK=%.4f status=%s (activation #%d) "
+                        "— ubx clamp violated or bypassed",
+                        slack_max, status, self._slack_activation_count,
+                    )
+                elif status in _STATUS_ITER_FAIL:
+                    _LOG.warning(
+                        "MPC iter limit hit: slack=%.4f status=%s (activation #%d)",
+                        slack_max, status, self._slack_activation_count,
+                    )
+                else:
+                    _LOG.info(
+                        "Lyapunov soft slack=%.4f status=%s (activation #%d)",
+                        slack_max, status, self._slack_activation_count,
+                    )
+
         # Clamp away IPOPT barrier numerical noise (~1e-8 below zero).
         energy_step = max(0.0, float(E_opt[1] - E_opt[0]))
         self._cum_energy += energy_step
@@ -373,21 +477,45 @@ class LyapunovMPC:
         self,
         state: Sequence[float],
         goal: Sequence[float],
+        alpha_l: Optional[float] = None,
     ) -> Tuple[float, float, ControllerFeedback]:
-        """Phase-1 compatible signature returning ``(v, omega, feedback)``."""
-        fb = self.compute_control(state=state, goal=goal)
+        """Phase-1 compatible signature returning ``(v, omega, feedback)``.
+
+        Parameters
+        ----------
+        alpha_l:
+            Lyapunov contraction rate override. Defaults to config when None.
+        """
+        fb = self.compute_control(state=state, goal=goal, alpha_l=alpha_l)
         return fb.v, fb.omega, fb
 
     def reset(self) -> None:
-        """Clear warm-start state and cumulative energy for a new episode."""
+        """Clear warm-start state, counters, and cumulative energy for a new episode."""
         self._prev_X = None
         self._prev_U = None
         self._prev_S = None
         self._prev_lam_x = None
         self._prev_lam_g = None
         self._cum_energy = 0.0
+        self._slack_activation_count = 0
+
+    @property
+    def slack_activation_count(self) -> int:
+        """Number of compute_control calls where the soft Lyapunov slack was
+        active (slack_max > 1e-6).
+
+        Counts soft-constraint relaxations across the current episode.
+        Reset to zero when :meth:`reset` is called.
+        """
+        return int(self._slack_activation_count)
 
     @property
     def fallback_count(self) -> int:
-        """Number of compute_control calls that activated the soft fallback."""
-        return int(self._fallback_count)
+        """Deprecated alias for :attr:`slack_activation_count`.
+
+        .. deprecated::
+            Use :attr:`slack_activation_count` instead.  The old name
+            incorrectly suggested this counted P-controller fallbacks
+            rather than soft-constraint activation events.
+        """
+        return int(self._slack_activation_count)

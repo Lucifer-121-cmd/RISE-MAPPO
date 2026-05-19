@@ -289,7 +289,7 @@ def test_lyap_mpc_infeasibility_recovery() -> None:
     mpc = _make_mpc(alpha_lyap=0.99, soft_lyap_penalty=1e3)
     fb = mpc.compute_control([0.0, 0.0, 0.0], [2.0, 1.0])
     assert np.isfinite(fb.v) and np.isfinite(fb.omega)
-    assert fb.feasible is True or mpc.fallback_count >= 1
+    assert fb.feasible is True or mpc.slack_activation_count >= 1
 
 
 def test_lyap_mpc_reset_clears_state() -> None:
